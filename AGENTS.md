@@ -26,7 +26,12 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     (`lib.importTOML`); bump the version there, nowhere else.
   - The socket path is a package argument (`socketPath`, default
     `/run/deezns/resolve.sock`) exported as `DEEZNS_SOCKET_PATH`, which
-    `build.rs` bakes into both the daemon and the NSS module.
+    `build.rs` bakes into both the daemon and the NSS module. It has to
+    be a compile-time option: glibc loads the NSS module into arbitrary
+    processes with no configuration channel (nsswitch.conf carries no
+    settings, and environment variables are unreliable there), so the
+    path must be inside the shared object, and the daemon is built with
+    the same value to stay consistent.
   - `postInstall` renames cargo's `libnss_deezns.so` to
     `libnss_deezns.so.2` (the name glibc looks up) and sets its SONAME
     to match; the example policy is installed under `share/doc/deezns/`.

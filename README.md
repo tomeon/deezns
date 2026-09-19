@@ -167,6 +167,18 @@ RUST_LOG=info deezns-daemon
 
 Set at build time: `DEEZNS_SOCKET_PATH=/my/path cargo build`
 
+The socket path is a compile-time option rather than a runtime one
+because of the NSS module. glibc loads `libnss_deezns.so.2` into
+whatever process happens to call `getaddrinfo()` and gives it nothing
+but the name to look up: NSS has no configuration mechanism of its own
+(`/etc/nsswitch.conf` only names the modules and their actions), the
+module cannot take command-line arguments, and it cannot rely on
+environment variables, which are unset for setuid programs and system
+services and would differ from process to process anyway. So the path
+has to live inside the shared object itself. `build.rs` bakes the same
+value into the daemon so the two sides can never disagree; moving the
+socket means rebuilding both.
+
 ## Future directions
 
 - **Live blocklist reload** via `SIGHUP` or inotify.

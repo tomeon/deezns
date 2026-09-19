@@ -6,7 +6,12 @@ use std::net::IpAddr;
 /// Override at build time:
 ///   DEEZNS_SOCKET_PATH=/my/custom.sock cargo build
 ///
-/// The value is baked in by `build.rs` via `cargo:rustc-env`.
+/// The value is baked in by `build.rs` via `cargo:rustc-env`.  It cannot be
+/// a runtime setting: the NSS module is loaded by glibc into whichever
+/// process calls `getaddrinfo()` and receives no configuration from
+/// nsswitch.conf, no arguments, and no dependable environment, so the only
+/// place the path can live is inside the shared object.  Compiling the same
+/// constant into the daemon keeps both ends of the socket consistent.
 pub const SOCKET_PATH: &str = env!("DEEZNS_SOCKET_PATH");
 
 /// A DNS lookup request sent over the Unix socket.

@@ -5,7 +5,10 @@
   lib,
   rustPlatform,
   # The Unix socket the NSS module and the daemon talk over.  build.rs bakes
-  # it into both at compile time (see "Compile-time options" in README.md).
+  # it into both at compile time (see "Compile-time options" in README.md):
+  # glibc gives an NSS module no way to read configuration, so the path must
+  # be inside libnss_deezns.so.2 itself, and the daemon is compiled with the
+  # same value so the two cannot disagree.
   socketPath ? "/run/deezns/resolve.sock",
 }: let
   cargoToml = lib.importTOML ../Cargo.toml;
