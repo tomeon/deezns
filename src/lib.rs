@@ -59,7 +59,11 @@ fn filter_addrs(addrs: Vec<IpAddr>, family: AddressFamily) -> Option<Addresses> 
                     _ => None,
                 })
                 .collect();
-            if v4.is_empty() { None } else { Some(Addresses::V4(v4)) }
+            if v4.is_empty() {
+                None
+            } else {
+                Some(Addresses::V4(v4))
+            }
         }
         AddressFamily::IPv6 => {
             let v6: Vec<_> = addrs
@@ -69,12 +73,15 @@ fn filter_addrs(addrs: Vec<IpAddr>, family: AddressFamily) -> Option<Addresses> 
                     _ => None,
                 })
                 .collect();
-            if v6.is_empty() { None } else { Some(Addresses::V6(v6)) }
+            if v6.is_empty() {
+                None
+            } else {
+                Some(Addresses::V6(v6))
+            }
         }
         _ => {
             // AF_UNSPEC — return whatever we have, prefer v4.
-            let (v4, v6): (Vec<_>, Vec<_>) =
-                addrs.into_iter().partition(|a| a.is_ipv4());
+            let (v4, v6): (Vec<_>, Vec<_>) = addrs.into_iter().partition(|a| a.is_ipv4());
             if !v4.is_empty() {
                 Some(Addresses::V4(
                     v4.into_iter()
@@ -132,16 +139,14 @@ impl HostHooks for DeeznsHost {
             ResolveResponse::PassThrough => Response::Unavail,
 
             // ── Resolved ─────────────────────────────────────────────
-            ResolveResponse::Resolved { addresses } => {
-                match filter_addrs(addresses, family) {
-                    Some(addrs) => Response::Success(Host {
-                        name: name.to_string(),
-                        addresses: addrs,
-                        aliases: vec![],
-                    }),
-                    None => Response::NotFound,
-                }
-            }
+            ResolveResponse::Resolved { addresses } => match filter_addrs(addresses, family) {
+                Some(addrs) => Response::Success(Host {
+                    name: name.to_string(),
+                    addresses: addrs,
+                    aliases: vec![],
+                }),
+                None => Response::NotFound,
+            },
         }
     }
 

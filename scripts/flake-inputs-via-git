@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""Fetch or update the flake's github: inputs over git.
+
+Nix's github: fetcher talks to api.github.com and downloads tarballs from
+github.com, which some sandboxes block while still allowing anonymous
+git access.  This script does the same job through git only:
+
+  flake-inputs-via-git
+      Make sure the source tree of every locked github: input in
+      flake.lock is present in the Nix store, fetching each locked
+      revision with git and checking it against the locked narHash.
+      Afterwards `nix flake ...` commands find the inputs already in
+      the store and never contact GitHub.
+
+  flake-inputs-via-git --update [INPUT ...]
+      Move the named top-level inputs (default: all github: ones) to
+      the newest commit of their branch/tag, and rewrite flake.lock
+      with the new rev, narHash and lastModified.  This replaces
+      `nix flake update` where GitHub's API is unreachable.
+
+Inputs must already have an entry in flake.lock; adding a brand-new
+input still needs `nix flake lock` on a machine with GitHub access.
+"""
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+STORE_DIR = "/nix/store"
+NIX32_ALPHABET = "0123456789abcdfghijklmnpqrsvwxyz"
+
+
+def log(*args):
+    print(f"{Path(sys.argv[0]).name}:", *args, file=sys.stderr)
+
+
+def die(*args):
+    log(*args)
+    sys.exit(1)
+
+
+def ensure_nix_on_path():
+    if shutil.which("nix") is None:
+        home = Path.home()
+        os.environ["PATH"] = os.pathsep.join(
+            [
+                str(home / ".nix-profile/bin"),
+                "/nix/var/nix/profiles/default/bin",
+                os.environ.get("PATH", ""),
+            ]
+        )
+    if shutil.which("nix") is None:
+        die("nix not found on PATH")
+
+
+def run(cmd, check=True, **kwargs):
+    kwargs.setdefault("text", True)
+    return subprocess.run(cmd, check=check, **kwargs)
+
+
+def output(cmd, **kwargs):
+    return run(cmd, stdout=subprocess.PIPE, **kwargs).stdout.strip()
+
+
+# --- Nix store path arithmetic ---------------------------------------------
+#
+# The store path of a github: input is the fixed-output path of its NAR
+# hash with the name "source".  Reproducing Nix's computation lets us
+# know the path before fetching anything.
+
+
+def nix32(data: bytes) -> str:
+    length = (len(data) * 8 - 1) // 5 + 1
+    chars = []
+    for i in range(length - 1, -1, -1):
+        bit = i * 5
+        byte, offset = divmod(bit, 8)
+        value = data[byte] >> offset
+        if byte + 1 < len(data):
+            value |= data[byte + 1] << (8 - offset)
+        chars.append(NIX32_ALPHABET[value & 0x1F])
+    return "".join(chars)
+
+
+def compress_hash(digest: bytes, size: int = 20) -> bytes:
+    out = bytearray(size)
+    for i, byte in enumerate(digest):
+        out[i % size] ^= byte
+    return bytes(out)
+
+
+def source_store_path(nar_hash_sri: str, name: str = "source") -> str:
+    algo, b64 = nar_hash_sri.split("-", 1)
+    if algo != "sha256":
+        die(f"unsupported narHash algorithm {algo!r}")
+    hex_hash = base64.b64decode(b64).hex()
+    fingerprint = f"source:sha256:{hex_hash}:{STORE_DIR}:{name}"
+    digest = hashlib.sha256(fingerprint.encode()).digest()
+    return f"{STORE_DIR}/{nix32(compress_hash(digest))}-{name}"
+
+
+# --- git ---------------------------------------------------------------------
+
+
+class GitMirror:
+    """A bare repository caching objects of one GitHub repository."""
+
+    def __init__(self, owner: str, repo: str, cache_root: Path):
+        self.url = f"https://github.com/{owner}/{repo}"
+        self.dir = cache_root / f"{owner}--{repo}.git"
+        if not (self.dir / "HEAD").exists():
+            self.dir.mkdir(parents=True, exist_ok=True)
+            run(["git", "init", "-q", "--bare", str(self.dir)])
+
+    def git(self, *args, **kwargs):
+        return output(["git", "-C", str(self.dir), *args], **kwargs)
+
+    def has(self, rev: str) -> bool:
+        return (
+            run(
+                ["git", "-C", str(self.dir), "cat-file", "-e", f"{rev}^{{commit}}"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode
+            == 0
+        )
+
+    def fetch(self, rev: str):
+        if not self.has(rev):
+            log(f"fetching {self.url} at {rev}")
+            self.git("fetch", "-q", "--depth", "1", self.url, rev)
+        # Pin the commit so that git never garbage-collects it.
+        self.git("update-ref", f"refs/pinned/{rev}", rev)
+
+    def resolve(self, ref: str | None) -> str:
+        """Resolve a branch/tag name (or HEAD) to a commit id."""
+        wanted = ["HEAD"] if ref is None else [f"refs/heads/{ref}", f"refs/tags/{ref}"]
+        lines = output(["git", "ls-remote", self.url, *wanted]).splitlines()
+        candidates = {name: sha for sha, name in (line.split("\t") for line in lines)}
+        for name in wanted:
+            if name in candidates:
+                return candidates[name]
+        # An annotated tag resolves to the tag object; Nix wants the commit.
+        for name, sha in candidates.items():
+            if name.rstrip("^{}") in wanted:
+                return sha
+        die(f"{self.url}: no such branch or tag {ref!r}")
+
+    def commit_time(self, rev: str) -> int:
+        return int(self.git("log", "-1", "--format=%ct", rev))
+
+    def add_to_store(self, rev: str) -> str:
+        """Export the tree at rev and add it to the store the way the
+        github: fetcher would (an unpacked archive named "source")."""
+        with tempfile.TemporaryDirectory(prefix="flake-input-") as tmp:
+            tree = Path(tmp) / "source"
+            tree.mkdir()
+            archive = subprocess.Popen(
+                ["git", "-C", str(self.dir), "archive", "--format=tar", rev],
+                stdout=subprocess.PIPE,
+            )
+            run(["tar", "-x", "-C", str(tree)], stdin=archive.stdout)
+            if archive.wait() != 0:
+                die(f"git archive failed for {self.url} at {rev}")
+            return output(
+                ["nix", "store", "add", "--mode", "nar", "--name", "source", str(tree)]
+            )
+
+
+# --- flake.lock ----------------------------------------------------------------
+
+
+def github_nodes(lock: dict):
+    for name, node in lock["nodes"].items():
+        locked = node.get("locked", {})
+        if locked.get("type") == "github":
+            yield name, node
+
+
+def store_path_valid(path: str) -> bool:
+    return (
+        run(
+            ["nix", "path-info", path],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def ensure_present(lock: dict, mirrors: Path):
+    missing = []
+    for name, node in github_nodes(lock):
+        locked = node["locked"]
+        path = source_store_path(locked["narHash"])
+        if store_path_valid(path):
+            log(f"{name}: present ({path})")
+        else:
+            missing.append((name, node, path))
+
+    for name, node, path in missing:
+        locked = node["locked"]
+        mirror = GitMirror(locked["owner"], locked["repo"], mirrors)
+        mirror.fetch(locked["rev"])
+        added = mirror.add_to_store(locked["rev"])
+        if added != path:
+            die(
+                f"{name}: {mirror.url} at {locked['rev']} produced {added}, "
+                f"but flake.lock expects {path}.  The repository probably "
+                "uses export-ignore/export-subst, or the lock is stale."
+            )
+        log(f"{name}: added {path}")
+
+
+def update(lock: dict, mirrors: Path, wanted: list[str]) -> bool:
+    root_inputs = lock["nodes"][lock["root"]]["inputs"]
+    updatable = {
+        name: key
+        for name, key in root_inputs.items()
+        if isinstance(key, str)
+        and lock["nodes"][key].get("locked", {}).get("type") == "github"
+    }
+    if not wanted:
+        wanted = sorted(updatable)
+    changed = False
+    for name in wanted:
+        if name not in updatable:
+            die(
+                f"{name!r} is not a top-level github: input of this flake "
+                f"(candidates: {', '.join(sorted(updatable))})"
+            )
+        node = lock["nodes"][updatable[name]]
+        locked, original = node["locked"], node["original"]
+        mirror = GitMirror(locked["owner"], locked["repo"], mirrors)
+        rev = mirror.resolve(original.get("ref"))
+        if rev == locked["rev"]:
+            log(f"{name}: already at {rev}")
+            continue
+        mirror.fetch(rev)
+        path = mirror.add_to_store(rev)
+        nar_hash = output(["nix", "hash", "path", path])
+        log(f"{name}: {locked['rev']} -> {rev}")
+        node["locked"] = {
+            **locked,
+            "lastModified": mirror.commit_time(rev),
+            "narHash": nar_hash,
+            "rev": rev,
+        }
+        changed = True
+    return changed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="update inputs to the newest commit of their ref",
+    )
+    parser.add_argument(
+        "--flake", default=None, help="flake directory (default: this repository)"
+    )
+    parser.add_argument("inputs", nargs="*", help="inputs to update (default: all)")
+    args = parser.parse_args()
+    if args.inputs and not args.update:
+        parser.error("input names only make sense with --update")
+
+    ensure_nix_on_path()
+    flake_dir = (
+        Path(args.flake)
+        if args.flake
+        else Path(
+            output(
+                [
+                    "git",
+                    "-C",
+                    str(Path(__file__).resolve().parent),
+                    "rev-parse",
+                    "--show-toplevel",
+                ]
+            )
+        )
+    )
+    lock_file = flake_dir / "flake.lock"
+    if not lock_file.exists():
+        die(
+            f"{lock_file} does not exist; create it with `nix flake lock` "
+            "on a machine with GitHub access"
+        )
+    lock = json.loads(lock_file.read_text())
+    mirrors = (
+        Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+        / "deezns/git-mirrors"
+    )
+
+    if args.update:
+        if update(lock, mirrors, args.inputs):
+            lock_file.write_text(json.dumps(lock, indent=2, sort_keys=True) + "\n")
+            log(f"wrote {lock_file}")
+        else:
+            log("nothing to update")
+    ensure_present(lock, mirrors)
+    # Let Nix confirm the lock file and store contents agree.
+    run(
+        ["nix", "flake", "metadata", "--no-write-lock-file", str(flake_dir)],
+        stdout=subprocess.DEVNULL,
+    )
+    log("all github: inputs are in the store")
+
+
+if __name__ == "__main__":
+    main()

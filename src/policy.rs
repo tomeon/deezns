@@ -166,9 +166,8 @@ impl PolicyEngine {
         // Compile CEL rules.
         let mut rules = Vec::with_capacity(cfg.rules.len());
         for (i, rule_cfg) in cfg.rules.iter().enumerate() {
-            let program = Program::compile(&rule_cfg.expr).map_err(|e| {
-                format!("rule {} ({:?}): CEL compile error: {e}", i, rule_cfg.note)
-            })?;
+            let program = Program::compile(&rule_cfg.expr)
+                .map_err(|e| format!("rule {} ({:?}): CEL compile error: {e}", i, rule_cfg.note))?;
             rules.push(CompiledRule {
                 note: rule_cfg.note.clone(),
                 program,
@@ -190,13 +189,7 @@ impl PolicyEngine {
     }
 
     /// Evaluate the policy for a given query.
-    pub fn evaluate(
-        &self,
-        hostname: &str,
-        uid: u32,
-        gid: u32,
-        pid: i32,
-    ) -> PolicyVerdict {
+    pub fn evaluate(&self, hostname: &str, uid: u32, gid: u32, pid: i32) -> PolicyVerdict {
         let hostname_lower = hostname.to_ascii_lowercase();
 
         // Pre-compute blocklist membership so we can expose it as a
@@ -217,7 +210,8 @@ impl PolicyEngine {
             let mut ctx = Context::default();
 
             // Variables.
-            ctx.add_variable("hostname", hostname_lower.clone()).unwrap();
+            ctx.add_variable("hostname", hostname_lower.clone())
+                .unwrap();
             ctx.add_variable("uid", uid as i64).unwrap();
             ctx.add_variable("gid", gid as i64).unwrap();
             ctx.add_variable("pid", pid as i64).unwrap();
@@ -235,14 +229,13 @@ impl PolicyEngine {
                 Ok(Value::Bool(true)) => {
                     return match &rule.verdict {
                         RuleVerdict::Allow => PolicyVerdict::Allowed,
-                        RuleVerdict::Deny => PolicyVerdict::Denied(format!(
-                            "matched rule: {}",
-                            rule.note
-                        )),
+                        RuleVerdict::Deny => {
+                            PolicyVerdict::Denied(format!("matched rule: {}", rule.note))
+                        }
                         RuleVerdict::Passthrough => PolicyVerdict::PassThrough,
                     };
                 }
-                Ok(_) => continue,   // expression was false / non-bool
+                Ok(_) => continue, // expression was false / non-bool
                 Err(e) => {
                     tracing::error!(
                         rule = rule.note,
@@ -257,9 +250,9 @@ impl PolicyEngine {
         // No rule matched — apply default.
         match self.default_verdict {
             DefaultVerdict::Passthrough => PolicyVerdict::PassThrough,
-            DefaultVerdict::Deny => PolicyVerdict::Denied(
-                format!("{hostname_lower} denied by default policy"),
-            ),
+            DefaultVerdict::Deny => {
+                PolicyVerdict::Denied(format!("{hostname_lower} denied by default policy"))
+            }
         }
     }
 }
@@ -294,7 +287,8 @@ mod tests {
 
     #[test]
     fn first_matching_rule_wins() {
-        let engine = engine_from_toml(r#"
+        let engine = engine_from_toml(
+            r#"
             default_verdict = "passthrough"
 
             [[rules]]
@@ -306,7 +300,8 @@ mod tests {
             note = "allow everything for uid 1000"
             expr = "uid == 1000"
             verdict = "allow"
-        "#);
+        "#,
+        );
 
         // tiktok.com hits the first rule → deny
         assert!(matches!(
@@ -323,14 +318,16 @@ mod tests {
 
     #[test]
     fn default_deny_catches_unmatched() {
-        let engine = engine_from_toml(r#"
+        let engine = engine_from_toml(
+            r#"
             default_verdict = "deny"
 
             [[rules]]
             note = "only root"
             expr = "uid == 0"
             verdict = "allow"
-        "#);
+        "#,
+        );
 
         assert_eq!(
             engine.evaluate("anything.com", 0, 0, 1),
@@ -344,10 +341,12 @@ mod tests {
 
     #[test]
     fn default_passthrough_falls_through() {
-        let engine = engine_from_toml(r#"
+        let engine = engine_from_toml(
+            r#"
             default_verdict = "passthrough"
             rules = []
-        "#);
+        "#,
+        );
 
         assert_eq!(
             engine.evaluate("example.com", 1000, 1000, 1),
@@ -357,7 +356,8 @@ mod tests {
 
     #[test]
     fn cel_string_methods_work() {
-        let engine = engine_from_toml(r#"
+        let engine = engine_from_toml(
+            r#"
             default_verdict = "passthrough"
 
             [[rules]]
@@ -374,7 +374,8 @@ mod tests {
             note = "block anything with 'tracking'"
             expr = 'hostname.contains("tracking")'
             verdict = "deny"
-        "#);
+        "#,
+        );
 
         assert!(matches!(
             engine.evaluate("foo.local", 0, 0, 1),

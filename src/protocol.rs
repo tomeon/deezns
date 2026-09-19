@@ -44,7 +44,5 @@ pub enum ResolveResponse {
     PassThrough,
 
     /// Successfully resolved.
-    Resolved {
-        addresses: Vec<IpAddr>,
-    },
+    Resolved { addresses: Vec<IpAddr> },
 }

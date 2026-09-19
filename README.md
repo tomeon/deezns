@@ -55,29 +55,29 @@ Policy is defined in a TOML file (default: `/etc/deezns/policy.toml`).
 
 Every rule expression has access to:
 
-| Variable   | Type   | Description                      |
-|------------|--------|----------------------------------|
-| `hostname` | string | Queried hostname (lowercased)    |
-| `uid`      | int    | Peer UID from SO_PEERCRED        |
-| `gid`      | int    | Peer GID                         |
-| `pid`      | int    | Peer PID                         |
+| Variable   | Type   | Description                   |
+| ---------- | ------ | ----------------------------- |
+| `hostname` | string | Queried hostname (lowercased) |
+| `uid`      | int    | Peer UID from SO_PEERCRED     |
+| `gid`      | int    | Peer GID                      |
+| `pid`      | int    | Peer PID                      |
 
 ### CEL functions
 
-| Function                   | Returns | Description                                |
-|----------------------------|---------|--------------------------------------------|
-| `blocked_by("list_name")`  | bool    | True if hostname is in the named blocklist |
+| Function                  | Returns | Description                                |
+| ------------------------- | ------- | ------------------------------------------ |
+| `blocked_by("list_name")` | bool    | True if hostname is in the named blocklist |
 
 Plus all built-in CEL string methods: `endsWith`, `startsWith`, `contains`,
 `matches` (regex, requires the `regex` feature on `cel-interpreter`).
 
 ### Verdicts
 
-| Verdict       | NSS behaviour                                        |
-|---------------|------------------------------------------------------|
-| `deny`        | NXDOMAIN — stops the NSS chain                       |
-| `passthrough` | Return UNAVAIL — glibc tries the next source         |
-| `allow`       | Proceed with upstream resolution                     |
+| Verdict       | NSS behaviour                                |
+| ------------- | -------------------------------------------- |
+| `deny`        | NXDOMAIN — stops the NSS chain               |
+| `passthrough` | Return UNAVAIL — glibc tries the next source |
+| `allow`       | Proceed with upstream resolution             |
 
 Rules are evaluated in order; **first match wins**.
 
@@ -90,7 +90,7 @@ The blocklist loader (`src/blocklist.rs`) auto-detects three formats:
 - **AdBlock-style**: `||example.com^` (domain + all subdomains)
 
 This means you can point it at lists from StevenBlack/hosts, oisd, or any
-AdGuard/uBlock-compatible domain blocklist.  AdBlock exception rules
+AdGuard/uBlock-compatible domain blocklist. AdBlock exception rules
 (`@@||...`) are intentionally ignored at the blocklist layer — use a CEL
 rule with `verdict = "allow"` to create exceptions.
 
@@ -161,9 +161,9 @@ RUST_LOG=info deezns-daemon
 
 ## Compile-time options
 
-| Environment variable   | Default                    | Purpose               |
-|------------------------|----------------------------|-----------------------|
-| `DEEZNS_SOCKET_PATH`   | `/run/deezns/resolve.sock` | Unix socket path      |
+| Environment variable | Default                    | Purpose          |
+| -------------------- | -------------------------- | ---------------- |
+| `DEEZNS_SOCKET_PATH` | `/run/deezns/resolve.sock` | Unix socket path |
 
 Set at build time: `DEEZNS_SOCKET_PATH=/my/path cargo build`
 

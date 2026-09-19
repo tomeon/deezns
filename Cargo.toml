@@ -5,7 +5,7 @@ edition = "2021"
 
 [lib]
 name = "nss_deezns"
-crate-type = ["cdylib"]     # NSS module must be a C shared library
+crate-type = ["cdylib"] # NSS module must be a C shared library
 
 [[bin]]
 name = "deezns-daemon"
