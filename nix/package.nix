@@ -42,6 +42,10 @@ in
       install -Dm644 ${../config/policy.toml} "$out/share/doc/deezns/policy.toml"
     '';
 
+    # Lets the NixOS module find the socket without a second copy of the
+    # path in its own configuration.
+    passthru = {inherit socketPath;};
+
     meta = {
       description = "Per-UID DNS policy daemon with CEL rules and blocklist support";
       homepage = "https://github.com/tomeon/deezns";

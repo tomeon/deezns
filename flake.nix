@@ -21,7 +21,7 @@
   };
 
   outputs = inputs @ {flake-parts, ...}:
-    flake-parts.lib.mkFlake {inherit inputs;} {
+    flake-parts.lib.mkFlake {inherit inputs;} ({config, ...}: {
       imports = [
         inputs.devshell.flakeModule
         inputs.treefmt-nix.flakeModule
@@ -33,6 +33,11 @@
         "x86_64-linux"
         "aarch64-linux"
       ];
+
+      flake.nixosModules = {
+        deezns.imports = [./nix/module.nix];
+        default = config.flake.nixosModules.deezns;
+      };
 
       perSystem = {
         config,
@@ -95,5 +100,5 @@
           ];
         };
       };
-    };
+    });
 }
