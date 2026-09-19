@@ -1,0 +1,90 @@
+# /etc/mydns/policy.toml
+#
+# CEL-based DNS policy configuration.
+#
+# default_verdict applies when no rule matches:
+#   "passthrough" = punt to next NSS source (no opinion)
+#   "deny"        = NXDOMAIN everything not explicitly allowed
+default_verdict = "deny"
+
+# ── External blocklists ───────────────────────────────────────────────
+# Loaded at startup.  Supports hosts-file, domains-only, and AdBlock
+# (||domain^) formats.  Referenced in CEL via blocked_by("name").
+
+[[blocklists]]
+name = "stevenblack"
+path = "/etc/mydns/lists/stevenblack-hosts.txt"
+
+[[blocklists]]
+name = "oisd"
+path = "/etc/mydns/lists/oisd-abp.txt"
+
+# ── Rules (first match wins) ─────────────────────────────────────────
+#
+# CEL variables available in every rule:
+#   hostname : string  — queried hostname (lowercased)
+#   uid      : int     — peer UID (from SO_PEERCRED)
+#   gid      : int     — peer GID
+#   pid      : int     — peer PID
+#
+# CEL functions:
+#   blocked_by("list_name") : bool
+#       true if hostname appears in the named blocklist.
+#
+# CEL built-in string methods also work:
+#   hostname.endsWith(".foo.com")
+#   hostname.startsWith("bar-")
+#   hostname.contains("tracking")
+#   hostname.matches("^[0-9]+\\.analytics\\..*")   (requires `regex` feature)
+
+# --- Global ad/tracker deny (all users, all processes) ----------------
+[[rules]]
+note = "Global adblock/tracker deny"
+expr = 'blocked_by("stevenblack") || blocked_by("oisd")'
+verdict = "deny"
+
+# --- Per-UID policies -------------------------------------------------
+
+# Root (uid 0): allow everything not blocked above.
+[[rules]]
+note = "Root: allow all"
+expr = "uid == 0"
+verdict = "allow"
+
+# Developer user (uid 1000): strict allowlist.
+[[rules]]
+note = "uid 1000: development allowlist"
+expr = '''
+  uid == 1000 && (
+    hostname == "github.com" ||
+    hostname.endsWith(".github.com") ||
+    hostname == "crates.io" ||
+    hostname.endsWith(".crates.io") ||
+    hostname == "docs.rs" ||
+    hostname.endsWith(".docs.rs") ||
+    hostname == "nixos.org" ||
+    hostname.endsWith(".nixos.org") ||
+    hostname.endsWith(".archive.ubuntu.com") ||
+    hostname == "security.ubuntu.com"
+  )
+'''
+verdict = "allow"
+
+# Service account group (gid 1001): internal only.
+[[rules]]
+note = "gid 1001: internal corp"
+expr = '''
+  gid == 1001 && (
+    hostname == "internal.corp.example.com" ||
+    hostname.endsWith(".internal.corp.example.com")
+  )
+'''
+verdict = "allow"
+
+# --- Catch-all --------------------------------------------------------
+# (Not strictly needed with default_verdict = "deny", but explicit
+#  catch-alls are clearer for auditing.)
+[[rules]]
+note = "Explicit deny-all fallthrough"
+expr = "true"
+verdict = "deny"
