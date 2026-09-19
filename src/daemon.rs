@@ -69,10 +69,7 @@ async fn upstream_resolve(hostname: &str) -> Vec<IpAddr> {
 // Per-connection handler
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(
-    stream: UnixStream,
-    engine: Arc<PolicyEngine>,
-) -> io::Result<()> {
+async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io::Result<()> {
     let peer = get_peer_cred(&stream)?;
     info!(?peer, "accepted connection");
 
@@ -101,11 +98,7 @@ async fn handle_connection(
             }
 
             PolicyVerdict::PassThrough => {
-                info!(
-                    hostname = req.hostname,
-                    peer.uid, peer.pid,
-                    "PASSTHROUGH"
-                );
+                info!(hostname = req.hostname, peer.uid, peer.pid, "PASSTHROUGH");
                 ResolveResponse::PassThrough
             }
 
@@ -114,14 +107,14 @@ async fn handle_connection(
                 if addrs.is_empty() {
                     info!(
                         hostname = req.hostname,
-                        peer.uid, peer.pid,
-                        "ALLOWED (no local records, passing through)"
+                        peer.uid, peer.pid, "ALLOWED (no local records, passing through)"
                     );
                     ResolveResponse::PassThrough
                 } else {
                     info!(
                         hostname = req.hostname,
-                        peer.uid, peer.pid,
+                        peer.uid,
+                        peer.pid,
                         count = addrs.len(),
                         "RESOLVED"
                     );
