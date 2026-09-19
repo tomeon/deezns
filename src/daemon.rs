@@ -1,4 +1,4 @@
-//! mydns-daemon — async DNS resolver daemon with CEL-based policy.
+//! deezns-daemon — async DNS resolver daemon with CEL-based policy.
 
 mod blocklist;
 mod policy;
@@ -142,13 +142,13 @@ async fn handle_connection(
 // main
 // ---------------------------------------------------------------------------
 
-const DEFAULT_CONFIG_PATH: &str = "/etc/mydns/policy.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/deezns/policy.toml";
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config_path = std::env::var("MYDNS_CONFIG")
+    let config_path = std::env::var("DEEZNS_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(DEFAULT_CONFIG_PATH));
 

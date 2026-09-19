@@ -9,11 +9,11 @@
 //! # Each is loaded once at startup and exposed to CEL as a function.
 //! [[blocklists]]
 //! name = "stevenblack"
-//! path = "/etc/mydns/lists/stevenblack-hosts.txt"
+//! path = "/etc/deezns/lists/stevenblack-hosts.txt"
 //!
 //! [[blocklists]]
 //! name = "oisd"
-//! path = "/etc/mydns/lists/oisd-abp.txt"
+//! path = "/etc/deezns/lists/oisd-abp.txt"
 //!
 //! # Ordered rules.  First match wins.
 //! # Each rule has a CEL expression and a verdict.

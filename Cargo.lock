@@ -121,6 +121,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "deezns"
+version = "0.1.0"
+dependencies = [
+ "cel-interpreter",
+ "libc",
+ "libnss",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -261,22 +277,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a198f9589efc03f544388dfc4a19fe8af4323662b62f598b8dcfdac62c14771c"
 dependencies = [
  "byteorder",
-]
-
-[[package]]
-name = "my-dns-resolver"
-version = "0.1.0"
-dependencies = [
- "cel-interpreter",
- "libc",
- "libnss",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

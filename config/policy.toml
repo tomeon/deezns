@@ -1,4 +1,4 @@
-# /etc/mydns/policy.toml
+# /etc/deezns/policy.toml
 #
 # CEL-based DNS policy configuration.
 #
@@ -13,11 +13,11 @@ default_verdict = "deny"
 
 [[blocklists]]
 name = "stevenblack"
-path = "/etc/mydns/lists/stevenblack-hosts.txt"
+path = "/etc/deezns/lists/stevenblack-hosts.txt"
 
 [[blocklists]]
 name = "oisd"
-path = "/etc/mydns/lists/oisd-abp.txt"
+path = "/etc/deezns/lists/oisd-abp.txt"
 
 # ── Rules (first match wins) ─────────────────────────────────────────
 #

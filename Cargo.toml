@@ -1,14 +1,14 @@
 [package]
-name = "my-dns-resolver"
+name = "deezns"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "nss_mydns"
+name = "nss_deezns"
 crate-type = ["cdylib"]     # NSS module must be a C shared library
 
 [[bin]]
-name = "mydns-daemon"
+name = "deezns-daemon"
 path = "src/daemon.rs"
 
 [dependencies]

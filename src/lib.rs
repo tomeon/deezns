@@ -1,10 +1,10 @@
-//! NSS module — `libnss_mydns.so.2`
+//! NSS module — `libnss_deezns.so.2`
 //!
 //! nsswitch.conf:
-//!     hosts: files mydns [!UNAVAIL=return] dns
+//!     hosts: files deezns [!UNAVAIL=return] dns
 //!
 //! The `[!UNAVAIL=return]` action is important: it tells glibc that if
-//! mydns returns UNAVAIL (our "pass through" signal), it should NOT stop
+//! deezns returns UNAVAIL (our "pass through" signal), it should NOT stop
 //! the chain — it should continue to `dns`.  Without it, glibc's default
 //! for UNAVAIL is to stop looking.
 //!
@@ -104,10 +104,10 @@ fn filter_addrs(addrs: Vec<IpAddr>, family: AddressFamily) -> Option<Addresses> 
 // NSS glue
 // ---------------------------------------------------------------------------
 
-struct MyDnsHost;
-libnss::libnss_host_hooks!(mydns, MyDnsHost);
+struct DeeznsHost;
+libnss::libnss_host_hooks!(deezns, DeeznsHost);
 
-impl HostHooks for MyDnsHost {
+impl HostHooks for DeeznsHost {
     fn get_all_entries() -> Response<Vec<Host>> {
         Response::NotFound
     }

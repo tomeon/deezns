@@ -4,10 +4,10 @@ use std::net::IpAddr;
 /// Socket path — both daemon and NSS client agree on this.
 ///
 /// Override at build time:
-///   MYDNS_SOCKET_PATH=/my/custom.sock cargo build
+///   DEEZNS_SOCKET_PATH=/my/custom.sock cargo build
 ///
 /// The value is baked in by `build.rs` via `cargo:rustc-env`.
-pub const SOCKET_PATH: &str = env!("MYDNS_SOCKET_PATH");
+pub const SOCKET_PATH: &str = env!("DEEZNS_SOCKET_PATH");
 
 /// A DNS lookup request sent over the Unix socket.
 #[derive(Debug, Serialize, Deserialize)]

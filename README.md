@@ -1,12 +1,12 @@
-# mydns — per-UID DNS policy daemon with CEL rules and blocklist support
+# deezns — per-UID DNS policy daemon with CEL rules and blocklist support
 
 A Rust project demonstrating:
 
-1. **A tokio-based daemon** (`mydns-daemon`) that listens on a Unix domain
+1. **A tokio-based daemon** (`deezns-daemon`) that listens on a Unix domain
    socket, uses `SO_PEERCRED` to identify the calling process, and evaluates
    a CEL-based policy to allow, deny, or pass through DNS lookups.
 
-2. **An NSS module** (`libnss_mydns.so.2`) that glibc loads automatically
+2. **An NSS module** (`libnss_deezns.so.2`) that glibc loads automatically
    for `gethostbyname` / `getaddrinfo`.
 
 3. **A blocklist loader** that parses hosts-file, domains-only, and
@@ -23,13 +23,13 @@ A Rust project demonstrating:
             │  glibc NSS
             ▼
  ┌────────────────────────────────┐
- │  libnss_mydns.so.2             │  ← src/lib.rs
+ │  libnss_deezns.so.2            │  ← src/lib.rs
  │  blocking UDS client           │
  └──────────┬─────────────────────┘
             │  AF_UNIX stream
             ▼
  ┌────────────────────────────────┐
- │  mydns-daemon (tokio)          │  ← src/daemon.rs
+ │  deezns-daemon (tokio)         │  ← src/daemon.rs
  │                                │
  │  SO_PEERCRED → pid/uid/gid     │
  │        │                       │
@@ -49,7 +49,7 @@ A Rust project demonstrating:
 
 ## Policy configuration
 
-Policy is defined in a TOML file (default: `/etc/mydns/policy.toml`).
+Policy is defined in a TOML file (default: `/etc/deezns/policy.toml`).
 
 ### CEL variables
 
@@ -101,7 +101,7 @@ default_verdict = "deny"
 
 [[blocklists]]
 name = "stevenblack"
-path = "/etc/mydns/lists/stevenblack-hosts.txt"
+path = "/etc/deezns/lists/stevenblack-hosts.txt"
 
 [[rules]]
 note = "Block ads for everyone"
@@ -133,39 +133,39 @@ cargo build --release
 ## Installing
 
 ```bash
-sudo install -m 755 target/release/mydns-daemon /usr/local/bin/
-sudo install -m 644 target/release/libnss_mydns.so /usr/lib/libnss_mydns.so.2
+sudo install -m 755 target/release/deezns-daemon /usr/local/bin/
+sudo install -m 644 target/release/libnss_deezns.so /usr/lib/libnss_deezns.so.2
 sudo ldconfig
 ```
 
 Edit `/etc/nsswitch.conf`:
 
 ```
-hosts: files mydns [!UNAVAIL=return] dns
+hosts: files deezns [!UNAVAIL=return] dns
 ```
 
-The `[!UNAVAIL=return]` action tells glibc: if mydns returns UNAVAIL
+The `[!UNAVAIL=return]` action tells glibc: if deezns returns UNAVAIL
 (our "pass through" signal), continue to the next source.
 
 ## Running
 
 ```bash
-sudo mkdir -p /run/mydns /etc/mydns/lists
+sudo mkdir -p /run/deezns /etc/deezns/lists
 # Download a blocklist:
-curl -o /etc/mydns/lists/stevenblack-hosts.txt \
+curl -o /etc/deezns/lists/stevenblack-hosts.txt \
   https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts
 # Write your policy.toml (see config/policy.toml for an example)
 # Start the daemon:
-RUST_LOG=info mydns-daemon
+RUST_LOG=info deezns-daemon
 ```
 
 ## Compile-time options
 
 | Environment variable   | Default                    | Purpose               |
 |------------------------|----------------------------|-----------------------|
-| `MYDNS_SOCKET_PATH`   | `/run/mydns/resolve.sock`  | Unix socket path      |
+| `DEEZNS_SOCKET_PATH`   | `/run/deezns/resolve.sock` | Unix socket path      |
 
-Set at build time: `MYDNS_SOCKET_PATH=/my/path cargo build`
+Set at build time: `DEEZNS_SOCKET_PATH=/my/path cargo build`
 
 ## Future directions
 
