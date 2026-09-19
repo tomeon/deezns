@@ -5,7 +5,7 @@ program listening on a Unix socket and evaluating CEL rules) and the
 glibc NSS module (`libnss_deezns.so.2`) that consults it. The Rust
 sources live in `src/`, `build.rs`, `Cargo.toml` and `Cargo.lock`, with
 an example policy in `config/`. Everything Nix-related was added on
-top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`.
+top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
 
 ## Flake layout
 
@@ -41,14 +41,18 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`.
   also builds the packages and the devshell.
 - The devshell (`nix develop`, `menu`) provides the Rust toolchain, the
   treefmt wrapper, git, python3 and `flake-inputs-via-git` as a command.
+- `.github/workflows/checks.yml` runs `nix flake check -L` on every
+  push, pull request and manual dispatch, with the Nix store cached
+  between runs keyed on `flake.lock`.
 
 ## Conventions
 
 - Run `nix fmt` after every change and fix anything a formatter reports
   but cannot fix itself. treefmt runs rustfmt (edition taken from
   `Cargo.toml`), taplo (TOML), alejandra, deadnix and statix (Nix),
-  prettier (Markdown and other documentation), and ruff-check and
-  ruff-format (the listed Python scripts).
+  prettier (Markdown and other documentation, plus the workflow YAML),
+  actionlint (GitHub Actions workflows), and ruff-check and ruff-format
+  (the listed Python scripts).
 - The scripts in `scripts/` have no file extensions, so every new
   Python script must be added to the `ruff-check` and `ruff-format`
   `includes` lists in `flake.nix`.

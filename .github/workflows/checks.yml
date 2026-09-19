@@ -1,0 +1,40 @@
+name: Checks
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+jobs:
+  flake:
+    name: Run Nix flake checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Initialize Nix store paths
+        run: |
+          sudo mkdir -p /nix/store
+          sudo chmod -R 777 /nix
+      # https://github.com/cachix/install-nix-action/issues/56#issuecomment-1030697681
+      - name: Configure Nix store cache
+        uses: actions/cache@v6
+        with:
+          key: ${{ runner.os }}-${{ runner.arch }}-nix-store-${{ hashFiles('flake.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-nix-store-
+          # See https://github.com/actions/cache/pull/726 and
+          # https://github.com/actions/cache/issues/494 for caveats on negative
+          # patterns.
+          path: |
+            /nix/store/**
+            /nix/var/nix/*/*
+            /nix/var/nix/db/*
+            /nix/var/nix/db/*/**
+            !/nix/var/nix/daemon-socket/socket
+            !/nix/var/nix/userpool/*
+            !/nix/var/nix/gc.lock
+            !/nix/var/nix/db/big-lock
+            !/nix/var/nix/db/reserved
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+      - name: Run Nix flake checks
+        run: |
+          nix flake check -L

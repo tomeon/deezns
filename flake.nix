@@ -58,8 +58,10 @@
           programs.alejandra.enable = true;
           programs.deadnix.enable = true;
           programs.statix.enable = true;
-          # Documentation
+          # Documentation (and the workflow YAML)
           programs.prettier.enable = true;
+          # GitHub Actions workflows
+          programs.actionlint.enable = true;
           # Python written for this flake.  The scripts have no file
           # extensions, so list them.
           programs.ruff-check = {
