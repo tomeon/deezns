@@ -35,6 +35,8 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   - `postInstall` renames cargo's `libnss_deezns.so` to
     `libnss_deezns.so.2` (the name glibc looks up) and sets its SONAME
     to match; the example policy is installed under `share/doc/deezns/`.
+  - `passthru.socketPath` exposes the compiled-in socket path; the
+    NixOS module reads it from there.
   - The toolchain is nixpkgs' stable Rust (`rustc`, `cargo`, `clippy`,
     `rustfmt`, `rust-analyzer`). No third-party Rust flake
     (rust-overlay, fenix, crane) is used: the crate is edition 2021 with
@@ -42,13 +44,36 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     toolchain builds it and adding an input would only add a second
     Rust to keep in sync. Reach for rust-overlay or fenix only if the
     project grows a real need for a pinned or nightly toolchain.
+- `nixosModules.deezns` (also `nixosModules.default`) is
+  `nix/module.nix`: `services.deezns.{enable,package,settings,nssOrder}`
+  plus a read-only `socketPath` taken from the package's
+  `passthru.socketPath`. The daemon runs as user `deezns` under a
+  hardened systemd unit; the package goes into `system.nssModules` and
+  `deezns [!UNAVAIL=return]` into the `hosts` line of nsswitch.conf.
+  Two NixOS facts shape the module and are worth keeping in mind:
+  - NixOS loads third-party NSS modules only inside nscd (nsncd), so
+    every lookup made through glibc reaches the daemon from nscd's
+    process. The module adds the nscd user to group `deezns` so it can
+    open the 0660 socket, and the `uid`, `gid` and `pid` CEL variables
+    hold nscd's credentials for such lookups, not the caller's. Only
+    direct socket clients are identified individually.
+  - `[!UNAVAIL=return]` makes every status except UNAVAIL final; glibc's
+    default is `SUCCESS=return` and `continue` for the rest, so without
+    it a denial would fall through to `dns`.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.
+- `checks.<system>.nixos-test` is `pkgs.testers.runNixOSTest ./nix/test.nix`:
+  a `resolver` VM running dnsmasq for a set of test names and a `client`
+  VM running the module. The script looks every name up both directly
+  against the resolver (`dig`) and through glibc (`getent ahosts`), and
+  checks the daemon's verdicts over its socket as different users. See
+  "NixOS test" below for running it in the sandbox.
 - The devshell (`nix develop`, `menu`) provides the Rust toolchain, the
   treefmt wrapper, git, python3 and `flake-inputs-via-git` as a command.
 - `.github/workflows/checks.yml` runs `nix flake check -L` on every
   push, pull request and manual dispatch, with the Nix store cached
-  between runs keyed on `flake.lock`.
+  between runs keyed on `flake.lock`. A udev rule opens `/dev/kvm` to
+  everyone first, since the VM test needs it inside the build sandbox.
 
 ## Conventions
 
@@ -82,6 +107,25 @@ cargo test              # inside `nix develop`; also run by nix build
 A `nix build` from scratch compiles the crate and its ~90 dependencies,
 a few minutes on a laptop. Run it detached and follow the log rather
 than waiting on a foreground command with a timeout.
+
+### NixOS test
+
+`nix flake check` includes the VM test, whose derivation requires the
+`kvm` system feature. The development sandbox has no `/dev/kvm`, so Nix
+does not advertise the feature and refuses to build it; passing the
+feature explicitly makes Nix accept the derivation, and QEMU
+(`-machine accel=kvm:tcg`) falls back to software emulation:
+
+```
+nix flake check -L --option system-features "nixos-test benchmark big-parallel kvm"
+nix build -L --option system-features "nixos-test benchmark big-parallel kvm" .#checks.x86_64-linux.nixos-test
+```
+
+Emulated, the two VMs take on the order of ten minutes; run it
+detached. The test can also be driven interactively with
+`nix build .#checks.x86_64-linux.nixos-test.driverInteractive` and
+`result/bin/nixos-test-driver`. On a machine with KVM the plain
+commands work.
 
 ## Helper scripts (`scripts/`, also devshell commands)
 

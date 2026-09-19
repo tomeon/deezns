@@ -49,6 +49,11 @@
           default = config.packages.deezns;
         };
 
+        # The VM test boots two machines (a resolver and a deezns client),
+        # so it needs KVM, or a builder that declares the `kvm` feature and
+        # lets QEMU fall back to emulation.  See "NixOS test" in AGENTS.md.
+        checks.nixos-test = pkgs.testers.runNixOSTest ./nix/test.nix;
+
         treefmt = {
           projectRootFile = "flake.nix";
 
