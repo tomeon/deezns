@@ -60,6 +60,16 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   - `[!UNAVAIL=return]` makes every status except UNAVAIL final; glibc's
     default is `SUCCESS=return` and `continue` for the rest, so without
     it a denial would fall through to `dns`.
+- `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, a
+  prototype answer to the credentials problem above: nsncd records each
+  client's `SO_PEERCRED` in a thread-local while handling its request
+  and exports it from the binary as `nsncd_peer_cred()`, which an NSS
+  module can find with `dlsym(RTLD_DEFAULT, ...)` on the thread doing
+  the lookup. The daemon and NSS module do not use it yet; wiring it up
+  means the module forwarding the credentials in its request and the
+  daemon accepting them only from a configured trusted uid (nscd's).
+  The patch is a git format-patch against nsncd v1.5.2 and carries its
+  own unit tests, which `nix build .#nsncd` runs.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.
 - `checks.<system>.nixos-test` is `pkgs.testers.runNixOSTest ./nix/test.nix`:

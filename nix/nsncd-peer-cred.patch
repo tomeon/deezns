@@ -1,0 +1,266 @@
+From dab4672e165ab1d854c2546899f519e837c7653c Mon Sep 17 00:00:00 2001
+From: Matt Schreiber <deezns@example.invalid>
+Date: Sat, 19 Sep 2026 18:42:57 +0000
+Subject: [PATCH] Expose the client's SO_PEERCRED to NSS modules
+
+nsncd performs every lookup in its own process, so an NSS module that
+identifies its caller (through SO_PEERCRED on a socket it opens, or
+getuid()) sees nsncd rather than the process that asked.
+
+Record the client's SO_PEERCRED in a thread-local for the duration of
+each request and export it from the binary as nsncd_peer_cred(), a C
+function an NSS module can find with dlsym(RTLD_DEFAULT, ...) and call
+from the thread performing the lookup.
+---
+ README.md        |  26 ++++++++
+ build.rs         |   6 ++
+ src/main.rs      |  10 +++
+ src/peer_cred.rs | 158 +++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 200 insertions(+)
+ create mode 100644 build.rs
+ create mode 100644 src/peer_cred.rs
+
+diff --git a/README.md b/README.md
+index 4b4117e..87bd818 100644
+--- a/README.md
++++ b/README.md
+@@ -52,6 +52,32 @@ request a file descriptor pointing into internal cache structures).
+ 
+ `NSNCD_SOCKET_PATH` may be set to override the default location of the socket.
+ 
++## Caller credentials for NSS modules
++
++Because `nsncd` performs every lookup in its own process, an NSS module that
++identifies its caller (for example through `SO_PEERCRED` on a socket it opens,
++or `getuid()`) sees `nsncd` rather than the process that asked. While a request
++is being handled, the worker thread has the client's `SO_PEERCRED` (pid, uid
++and gid of the process that connected to `/var/run/nscd/socket`) available to
++modules through an exported C function:
++
++```c
++#include <dlfcn.h>
++#include <sys/socket.h>
++
++int (*nsncd_peer_cred)(struct ucred *) = dlsym(RTLD_DEFAULT, "nsncd_peer_cred");
++struct ucred caller;
++if (nsncd_peer_cred != NULL && nsncd_peer_cred(&caller) == 0) {
++    /* caller.pid, caller.uid, caller.gid */
++}
++```
++
++`dlsym` returns null when the module is not running inside `nsncd` (or inside
++an `nsncd` without this feature); the function returns -1 when the calling
++thread is not handling a client request. A module that acts on these values
++trusts `nsncd` to relay them honestly; the values themselves come from the
++kernel.
++
+ ## Bug Reports and Contributions
+ 
+ Please create GitHub issues and/or pull requests.
+diff --git a/build.rs b/build.rs
+new file mode 100644
+index 0000000..92e88f5
+--- /dev/null
++++ b/build.rs
+@@ -0,0 +1,6 @@
++fn main() {
++    // An executable exports nothing to dlsym(3) unless told to.  NSS modules
++    // loaded into nsncd look this symbol up to learn who they are serving;
++    // see src/peer_cred.rs.
++    println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic-symbol=nsncd_peer_cred");
++}
+diff --git a/src/main.rs b/src/main.rs
+index 29e89bb..d15904b 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -61,6 +61,7 @@ use std::env;
+ mod config;
+ mod ffi;
+ mod handlers;
++mod peer_cred;
+ mod protocol;
+ mod work_group;
+ 
+@@ -206,6 +207,15 @@ fn handle_stream(log: &slog::Logger, config: &Config, mut stream: UnixStream) {
+     };
+     let type_str = format!("{:?}", request.ty);
+     let log = log.new(o!("request_type" => type_str));
++    // Let NSS modules loaded into this process find out who is asking; see
++    // peer_cred.rs.  The lookup happens on this thread, inside handle_request.
++    let _peer_cred = match peer_cred::of(&stream) {
++        Ok(cred) => Some(peer_cred::PeerCredGuard::new(cred)),
++        Err(e) => {
++            debug!(log, "reading peer credentials"; "err" => %e);
++            None
++        }
++    };
+     let response = match handlers::handle_request(&log, config, &request) {
+         Ok(x) => x,
+         Err(e) => {
+diff --git a/src/peer_cred.rs b/src/peer_cred.rs
+new file mode 100644
+index 0000000..f8f146f
+--- /dev/null
++++ b/src/peer_cred.rs
+@@ -0,0 +1,158 @@
++/*
++ * Copyright 2020-2022 Two Sigma Open Source, LLC
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++//! The credentials of the client whose request a thread is handling.
++//!
++//! nsncd performs every lookup in its own process, so an NSS module that
++//! identifies its caller through `SO_PEERCRED` (or `getuid()`) sees nsncd,
++//! not the process that asked.  To give such modules the real caller, the
++//! worker thread records the client's `SO_PEERCRED` for the duration of the
++//! request and this module exports it as a C function, [`nsncd_peer_cred`],
++//! which an NSS module loaded into nsncd can find with
++//! `dlsym(RTLD_DEFAULT, "nsncd_peer_cred")` and call from the thread doing
++//! the lookup:
++//!
++//! ```c
++//! int (*peer_cred)(struct ucred *) = dlsym(RTLD_DEFAULT, "nsncd_peer_cred");
++//! struct ucred cred;
++//! if (peer_cred != NULL && peer_cred(&cred) == 0) {
++//!     /* cred.pid, cred.uid and cred.gid identify the process that asked */
++//! }
++//! ```
++//!
++//! A null `dlsym` result means the module is not running inside nsncd (or
++//! inside an nsncd without this feature); -1 means the calling thread is not
++//! handling a client request.  The values are what the kernel reported for
++//! the client's connection to nsncd, so they are as trustworthy as nsncd
++//! itself: a module that acts on them is trusting nsncd to relay them
++//! honestly.
++
++use std::cell::Cell;
++use std::os::fd::AsFd;
++
++use nix::libc::{c_int, ucred};
++use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
++
++thread_local! {
++    static PEER_CRED: Cell<Option<ucred>> = const { Cell::new(None) };
++}
++
++/// Marks the calling thread as handling a request from the client with the
++/// given credentials until dropped.
++pub struct PeerCredGuard {
++    _private: (),
++}
++
++impl PeerCredGuard {
++    pub fn new(cred: ucred) -> Self {
++        PEER_CRED.with(|c| c.set(Some(cred)));
++        PeerCredGuard { _private: () }
++    }
++}
++
++impl Drop for PeerCredGuard {
++    fn drop(&mut self) {
++        PEER_CRED.with(|c| c.set(None));
++    }
++}
++
++/// The credentials of the peer of a connected Unix stream socket, as
++/// recorded by the kernel when the peer connected.
++pub fn of<F: AsFd>(socket: &F) -> nix::Result<ucred> {
++    let cred = getsockopt(socket, PeerCredentials)?;
++    Ok(ucred {
++        pid: cred.pid(),
++        uid: cred.uid(),
++        gid: cred.gid(),
++    })
++}
++
++/// Fills `cred` with the credentials of the client whose request the calling
++/// thread is handling and returns 0.  Returns -1 when the thread is not
++/// handling a request or `cred` is null.
++///
++/// Exported from the nsncd binary for NSS modules; see the module
++/// documentation.
++#[no_mangle]
++pub extern "C" fn nsncd_peer_cred(cred: *mut ucred) -> c_int {
++    if cred.is_null() {
++        return -1;
++    }
++    match PEER_CRED.with(|c| c.get()) {
++        Some(current) => {
++            // SAFETY: the caller promised a valid, writable `struct ucred`.
++            unsafe { cred.write(current) };
++            0
++        }
++        None => -1,
++    }
++}
++
++#[cfg(test)]
++mod test {
++    use super::*;
++
++    use std::os::unix::net::UnixStream;
++    use std::ptr;
++
++    fn empty() -> ucred {
++        ucred {
++            pid: 0,
++            uid: 0,
++            gid: 0,
++        }
++    }
++
++    #[test]
++    fn peer_of_a_socket_pair_is_this_process() {
++        let (ours, _theirs) = UnixStream::pair().unwrap();
++        let cred = of(&ours).unwrap();
++        assert_eq!(cred.pid, std::process::id() as i32);
++        assert_eq!(cred.uid, nix::unistd::geteuid().as_raw());
++        assert_eq!(cred.gid, nix::unistd::getegid().as_raw());
++    }
++
++    #[test]
++    fn accessor_reports_credentials_only_while_the_guard_lives() {
++        let mut out = empty();
++        assert_eq!(nsncd_peer_cred(&mut out), -1);
++        {
++            let _guard = PeerCredGuard::new(ucred {
++                pid: 42,
++                uid: 1000,
++                gid: 100,
++            });
++            assert_eq!(nsncd_peer_cred(&mut out), 0);
++            assert_eq!((out.pid, out.uid, out.gid), (42, 1000, 100));
++            assert_eq!(nsncd_peer_cred(ptr::null_mut()), -1);
++        }
++        assert_eq!(nsncd_peer_cred(&mut out), -1);
++    }
++
++    #[test]
++    fn credentials_are_per_thread() {
++        let _guard = PeerCredGuard::new(ucred {
++            pid: 1,
++            uid: 2,
++            gid: 3,
++        });
++        let other_thread = std::thread::spawn(|| nsncd_peer_cred(&mut empty()))
++            .join()
++            .unwrap();
++        assert_eq!(other_thread, -1);
++        assert_eq!(nsncd_peer_cred(&mut empty()), 0);
++    }
++}
+-- 
+2.43.0
+
