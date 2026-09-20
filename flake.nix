@@ -97,16 +97,20 @@
         };
 
         devshells.default = {
-          packages = [
-            config.treefmt.build.wrapper
-            pkgs.cargo
-            pkgs.rustc
-            pkgs.clippy
-            pkgs.rust-analyzer
-            pkgs.rustfmt
-            pkgs.git
-            pkgs.python3
-          ];
+          packages =
+            [
+              config.treefmt.build.wrapper
+            ]
+            ++ (with pkgs; [
+              cargo
+              clippy
+              git
+              python3
+              rust-analyzer
+              rustc
+              rustfmt
+            ]);
+
           commands = [
             {
               name = "flake-inputs-via-git";
