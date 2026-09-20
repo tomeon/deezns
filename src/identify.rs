@@ -4,8 +4,10 @@
 //! kernel knows which socket it left from.  `/proc/net/{udp,udp6,tcp,tcp6}`
 //! list every socket with its local address, the uid of its owner and its
 //! inode; the uid is readable by anyone.  Turning the inode into a process
-//! (and from there into a gid) means finding it among `/proc/<pid>/fd`, and
-//! reading another user's fd table needs `CAP_SYS_PTRACE`.  Without it the
+//! (and from there into a gid) means finding it among `/proc/<pid>/fd`.
+//! Another user's fd directory is mode 0500 and owned by that user, so
+//! listing it needs `CAP_DAC_READ_SEARCH`, and following its links needs
+//! `CAP_SYS_PTRACE` (this is why `ss -p` wants root).  Without both, the
 //! caller is identified by uid alone and `gid` and `pid` stay unknown.
 
 use crate::policy::Caller;
@@ -66,14 +68,18 @@ pub fn find_socket(entries: &[SocketEntry], peer: SocketAddr) -> Option<&SocketE
 }
 
 /// Whether this process may read other processes' fd tables (it can
-/// always read its own).  Probed once: pid 1 belongs to root, so reading
-/// its fd table succeeds only with `CAP_SYS_PTRACE` (or as root).
+/// always read its own).  Probed once: pid 1 belongs to root, so listing
+/// its fd directory and resolving an entry succeeds only with
+/// `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE` (or as root).
 fn can_inspect_other_processes() -> bool {
     static CAN: OnceLock<bool> = OnceLock::new();
     *CAN.get_or_init(|| {
-        let can = Process::new(1).and_then(|p| p.fd()).is_ok();
+        let can = Process::new(1)
+            .and_then(|p| p.fd())
+            .map(|mut fds| fds.next().is_some_and(|fd| fd.is_ok()))
+            .unwrap_or(false);
         if !can {
-            info!("cannot read other processes' file descriptors (no CAP_SYS_PTRACE); DNS callers are identified by uid only");
+            info!("cannot read other processes' file descriptors (needs CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE); DNS callers are identified by uid only");
         }
         can
     })
@@ -81,8 +87,8 @@ fn can_inspect_other_processes() -> bool {
 
 /// The process holding the socket with this inode, if it can be found.
 pub fn process_with_socket(inode: u64) -> Option<Process> {
-    // Our own process is always readable; anyone else's only with
-    // CAP_SYS_PTRACE.  Skip the (expensive) scan when it cannot succeed.
+    // Our own process is always readable; anyone else's only with the
+    // capabilities above.  Skip the (expensive) scan when it cannot succeed.
     let own = Process::myself().ok();
     let candidates: Box<dyn Iterator<Item = Process>> = if can_inspect_other_processes() {
         Box::new(all_processes().ok()?.filter_map(Result::ok))

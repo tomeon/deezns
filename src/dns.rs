@@ -5,7 +5,8 @@
 //! programs with their own DNS client alike.  A query carries no
 //! credentials, so the caller is identified from the socket it came out of
 //! (see `identify.rs`): the uid is always available, the gid and pid only
-//! when the daemon may read other processes' file descriptors.
+//! when the daemon may read other processes' file descriptors
+//! (`CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`).
 //!
 //! Denied names get NXDOMAIN, the daemon's own records are answered
 //! directly, and everything else is forwarded verbatim to the configured

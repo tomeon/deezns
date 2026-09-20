@@ -208,11 +208,13 @@ A DNS query carries no credentials, so the caller is read off the socket
 it came from: `/proc/net/udp`, `/proc/net/udp6`, `/proc/net/tcp` and
 `/proc/net/tcp6` list every local socket with its owner's uid and its
 inode, readable by anyone. Turning the inode into a process, and so into
-a `gid` and `pid`, means finding it under `/proc/<pid>/fd`, which for
-other users' processes needs `CAP_SYS_PTRACE`; without that capability
-the daemon says so once at startup and rules see `gid == -1` and
-`pid == -1`. `uid` is `-1` only when no local socket matches the query,
-which does not happen for queries from this machine.
+a `gid` and `pid`, means finding it under `/proc/<pid>/fd`. For another
+user's process that takes two capabilities: `CAP_DAC_READ_SEARCH` to
+list the fd directory (it is mode 0500 and owned by that user) and
+`CAP_SYS_PTRACE` to follow its links, the same reason `ss -p` wants
+root. Without them the daemon says so once at startup and rules see
+`gid == -1` and `pid == -1`. `uid` is `-1` only when no local socket
+matches the query, which does not happen for queries from this machine.
 
 Denied names get NXDOMAIN, the daemon's own records are answered
 directly, and everything else is forwarded verbatim to the upstream

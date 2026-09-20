@@ -22,7 +22,8 @@ default_verdict = "deny"
 # ── DNS front-end (optional) ──────────────────────────────────────────
 # Serve DNS on loopback and point resolv.conf here; callers are
 # identified from their sockets (uid always; gid and pid only with
-# CAP_SYS_PTRACE, otherwise -1).  See "Running as the local DNS server"
+# CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE, otherwise -1).  See "Running
+# as the local DNS server"
 # in README.md.
 #
 # [dns_frontend]
