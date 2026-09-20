@@ -6,8 +6,11 @@
 # and regexes, the uid/gid/pid variables, all three rule verdicts, both
 # default verdicts and the daemon's own address records.  Every name is
 # looked up twice: directly against the resolver (which must always answer)
-# and through the client's NSS stack (which must answer or refuse exactly as
+# and through the client's glibc (which must answer or refuse exactly as
 # the policy says).
+#
+# The client runs the default nscd front-end; specialisations switch it to
+# the NSS-module front-end and to a default-deny policy mid-test.
 {lib, ...}: let
   # Every name the resolver serves, with its address.  Only these names
   # exist upstream; the expected NSS outcome is in the test script.
@@ -181,9 +184,22 @@ in {
         };
       };
 
-      # The same policy with the other default verdict, switched to
-      # mid-test.
-      specialisation.default-deny.configuration.services.deezns.settings.default_verdict = lib.mkForce "deny";
+      # Switched to mid-test: the same policy with the other default
+      # verdict, and the NSS-module front-end.
+      specialisation = {
+        default-deny.configuration.services.deezns.settings.default_verdict = lib.mkForce "deny";
+        nss-module.configuration.services.deezns.frontend = "nss";
+      };
+
+      # A user that only nss-systemd knows, so `getent passwd dynuser`
+      # proves that passwd lookups still reach nsncd through deezns.
+      systemd.services.dynuser = {
+        wantedBy = ["multi-user.target"];
+        serviceConfig = {
+          DynamicUser = true;
+          ExecStart = "${pkgs.coreutils}/bin/sleep infinity";
+        };
+      };
 
       # alice and carol may query the daemon directly; bob may not.
       users.users = {
@@ -229,6 +245,9 @@ in {
     records = json.loads('${builtins.toJSON records}')
     resolver_ip = "${nodes.resolver.networking.primaryIPAddress}"
     socket_path = "${nodes.client.services.deezns.socketPath}"
+    # Specialisations are reached through the base system, since
+    # /run/current-system points at whichever one was switched to last.
+    base_system = "${nodes.client.system.build.toplevel}"
 
 
     def upstream(name):
@@ -261,22 +280,44 @@ in {
         return json.loads(client.succeed(f"runuser -u {user} -- deezns-query {name}"))
 
 
+    def nss_as(user, name):
+        """Like nss(), for a lookup made by `user`."""
+        status, out = client.execute(f"runuser -u {user} -- getent ahosts {name}")
+        if status != 0:
+            return None
+        return sorted({line.split()[0] for line in out.splitlines()})
+
+
+    def owner(path):
+        return client.succeed(f"stat -c %U {path}").strip()
+
+
     start_all()
     resolver.wait_for_unit("dnsmasq.service")
     client.wait_for_unit("multi-user.target")
     client.wait_for_unit("deezns.service")
     client.wait_for_file(socket_path)
+    client.wait_for_file("/run/nscd/socket")
 
     with subtest("The resolver serves every test name"):
         for name, address in records.items():
             assert upstream(name) == [address], f"{name} should resolve upstream to {address}"
 
-    with subtest("The NSS stack consults deezns after files and before dns"):
-        client.succeed(
-            r"grep -E '^hosts:.* files .*deezns \[!UNAVAIL=return\] .*dns' /etc/nsswitch.conf"
-        )
+    with subtest("deezns answers on nscd's socket, with nsncd behind it"):
+        assert owner("/run/nscd/socket") == "deezns"
+        assert owner("/run/nsncd/socket") == "nscd"
+        client.succeed("systemctl show nscd -p Environment | grep NSNCD_SOCKET_PATH=/run/nsncd/socket")
+        client.fail("grep -E '^hosts:.*deezns' /etc/nsswitch.conf")
+        client.succeed("journalctl -u deezns | grep 'listening (nscd front-end)'")
         client.succeed("journalctl -u deezns | grep 'policy engine ready'")
         assert client.succeed("journalctl -u deezns | grep -c 'loaded blocklist'").strip() == "3"
+
+    with subtest("Requests deezns does not judge reach nsncd unchanged"):
+        # alice is in /etc/passwd; dynuser exists only through nss-systemd,
+        # which NixOS loads into nsncd alone.
+        client.succeed("getent passwd alice")
+        client.succeed("getent passwd dynuser")
+        client.succeed("getent group staff")
 
     with subtest("Names no rule matches pass through to dns"):
         expect_resolved("unlisted.test")
@@ -321,6 +362,20 @@ in {
         assert nss("example.local") == ["10.0.0.1"]
         client.succeed("journalctl -u deezns | grep RESOLVED | grep 'hostname=\"example.local\"'")
 
+    with subtest("Per-user rules apply to lookups made through glibc"):
+        # Through nscd's socket the daemon sees the caller itself.
+        assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
+        assert nss_as("carol", "alice-only.test") is None
+        assert nss_as("carol", "staff-only.test") == [records["staff-only.test"]]
+        assert nss_as("alice", "staff-only.test") is None
+        assert nss_as("bob", "allowed.test") == [records["allowed.test"]]
+        client.succeed(
+            "journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid=${toString aliceUid} '"
+        )
+        client.succeed(
+            "journalctl -u deezns | grep 'hostname=\"staff-only.test\"' | grep 'peer.gid=${toString staffGid} '"
+        )
+
     with subtest("Per-user rules see the credentials of direct clients"):
         assert query("alice", "alice-only.test") == {"verdict": "PassThrough"}
         assert query("carol", "alice-only.test")["verdict"] == "Denied"
@@ -335,15 +390,19 @@ in {
     with subtest("Only group members can talk to the daemon directly"):
         client.fail("runuser -u bob -- deezns-query allowed.test")
 
-    with subtest("Lookups through glibc carry nscd's credentials"):
-        # NixOS routes every host lookup through nscd, which is the process
-        # that loads the NSS module and connects to the daemon, so the
-        # daemon sees nscd's uid rather than alice's.
-        nscd_uid = client.succeed("id -u nscd").strip()
-        client.fail("runuser -u alice -- getent ahosts alice-only.test")
-        client.succeed(
-            f"journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid}'"
-        )
+    with subtest("With nsncd stopped, deezns degrades but never lets a denial through"):
+        client.systemctl("stop nscd.service")
+        # Allowed names cannot be resolved (TRY_AGAIN), denied ones stay denied.
+        assert nss("allowed.test") is None
+        assert nss("ads.hosts-format.test") is None
+        client.succeed("journalctl -u deezns | grep 'answering TRY_AGAIN'")
+        # glibc serves what it can itself: /etc/passwd, but not nss-systemd.
+        client.succeed("getent passwd alice")
+        client.fail("getent passwd dynuser")
+        client.systemctl("start nscd.service")
+        client.wait_for_file("/run/nsncd/socket")
+        expect_resolved("allowed.test")
+        client.succeed("getent passwd dynuser")
 
     with subtest("The daemon is hardened"):
         # --threshold is on a 0-100 scale; the printed exposure level is a
@@ -351,16 +410,17 @@ in {
         client.succeed("systemd-analyze security --no-pager --threshold=20 deezns.service")
 
     with subtest("Without the daemon, lookups fall through to dns"):
+        # Stopping the daemon removes /run/nscd/socket; glibc then resolves
+        # in-process, unfiltered.
         client.systemctl("stop deezns.service")
+        client.fail("test -e /run/nscd/socket")
         expect_resolved("ads.hosts-format.test")
         client.systemctl("start deezns.service")
-        client.wait_for_file(socket_path)
+        client.wait_for_file("/run/nscd/socket")
         expect_blocked("ads.hosts-format.test")
 
     with subtest("With default_verdict = deny, unmatched names are refused"):
-        client.succeed(
-            "/run/current-system/specialisation/default-deny/bin/switch-to-configuration test"
-        )
+        client.succeed(f"{base_system}/specialisation/default-deny/bin/switch-to-configuration test")
         client.wait_for_unit("deezns.service")
         client.wait_until_succeeds("deezns-query unlisted.test | grep -q Denied")
         expect_blocked("unlisted.test")
@@ -368,5 +428,29 @@ in {
         # An explicit passthrough verdict still hands the name to dns.
         expect_resolved("skip.passthrough.test")
         assert nss("example.local") == ["10.0.0.1"]
+
+    with subtest("The NSS-module front-end blocks the same names"):
+        client.succeed(f"{base_system}/specialisation/nss-module/bin/switch-to-configuration test")
+        client.wait_for_unit("deezns.service")
+        client.wait_for_unit("nscd.service")
+        client.wait_for_file(socket_path)
+        client.succeed(
+            r"grep -E '^hosts:.* files .*deezns \[!UNAVAIL=return\] .*dns' /etc/nsswitch.conf"
+        )
+        assert owner("/run/nscd/socket") == "nscd"
+        client.fail("test -e /run/nsncd/socket")
+        expect_blocked("ads.hosts-format.test")
+        expect_blocked("evil.suffix.test")
+        expect_resolved("allowed.test")
+        assert nss("example.local") == ["10.0.0.1"]
+
+    with subtest("... but lookups through glibc carry nsncd's credentials"):
+        # NixOS runs the NSS module inside nsncd, which is what connects to
+        # the daemon, so the daemon sees nsncd's uid rather than alice's.
+        nscd_uid = client.succeed("id -u nscd").strip()
+        assert nss_as("alice", "alice-only.test") is None
+        client.succeed(
+            f"journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid} '"
+        )
   '';
 }

@@ -45,38 +45,46 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     Rust to keep in sync. Reach for rust-overlay or fenix only if the
     project grows a real need for a pinned or nightly toolchain.
 - `nixosModules.deezns` (also `nixosModules.default`) is
-  `nix/module.nix`: `services.deezns.{enable,package,settings,nssOrder}`
+  `nix/module.nix`: `services.deezns.{enable,package,frontend,settings}`
   plus a read-only `socketPath` taken from the package's
   `passthru.socketPath`. The daemon runs as user `deezns` under a
-  hardened systemd unit; the package goes into `system.nssModules` and
-  `deezns [!UNAVAIL=return]` into the `hosts` line of nsswitch.conf.
-  Two NixOS facts shape the module and are worth keeping in mind:
-  - NixOS loads third-party NSS modules only inside nscd (nsncd), so
-    every lookup made through glibc reaches the daemon from nscd's
-    process. The module adds the nscd user to group `deezns` so it can
-    open the 0660 socket, and the `uid`, `gid` and `pid` CEL variables
-    hold nscd's credentials for such lookups, not the caller's. Only
-    direct socket clients are identified individually.
-  - `[!UNAVAIL=return]` makes every status except UNAVAIL final; glibc's
-    default is `SUCCESS=return` and `continue` for the rest, so without
-    it a denial would fall through to `dns`.
-- `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, a
-  prototype answer to the credentials problem above: nsncd records each
-  client's `SO_PEERCRED` in a thread-local while handling its request
-  and exports it from the binary as `nsncd_peer_cred()`, which an NSS
+  hardened systemd unit. `frontend` picks how glibc's lookups reach it:
+  - `nscd` (default): the daemon answers on `/run/nscd/socket` in
+    nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
+    moved to `/run/nsncd/socket` via `NSNCD_SOCKET_PATH`, with its
+    RuntimeDirectory forced to match. Host lookups are judged with the
+    real caller's `SO_PEERCRED`; every other request is forwarded to
+    nsncd byte for byte. Assertions require nsncd, keep the three socket
+    paths distinct, and check nscd.service's effective
+    `NSNCD_SOCKET_PATH`. A denial must be answered as `found=0` with
+    `HOST_NOT_FOUND`: `found=-1` or a closed connection makes glibc
+    bypass nscd for its next hundred lookups.
+  - `nss`: the package goes into `system.nssModules` and
+    `deezns [!UNAVAIL=return]` into the `hosts` line at `nssOrder`.
+    NixOS loads third-party NSS modules only inside nsncd, so the
+    daemon then sees nsncd's uid, gid and pid for every lookup made
+    through glibc; the nscd user joins group `deezns` to reach the 0660
+    socket. `[!UNAVAIL=return]` makes every status except UNAVAIL
+    final; glibc's default is `SUCCESS=return` and `continue` for the
+    rest, so without it a denial would fall through to `dns`.
+- `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, an
+  earlier prototype for the same problem: nsncd records each client's
+  `SO_PEERCRED` in a thread-local while handling its request and
+  exports it from the binary as `nsncd_peer_cred()`, which an NSS
   module can find with `dlsym(RTLD_DEFAULT, ...)` on the thread doing
-  the lookup. The daemon and NSS module do not use it yet; wiring it up
-  means the module forwarding the credentials in its request and the
-  daemon accepting them only from a configured trusted uid (nscd's).
-  The patch is a git format-patch against nsncd v1.5.2 and carries its
-  own unit tests, which `nix build .#nsncd` runs.
+  the lookup. The nscd front-end made it unnecessary; it is kept as a
+  reference. The patch is a git format-patch against nsncd v1.5.2 and
+  carries its own unit tests, which `nix build .#nsncd` runs.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.
 - `checks.<system>.nixos-test` is `pkgs.testers.runNixOSTest ./nix/test.nix`:
   a `resolver` VM running dnsmasq for a set of test names and a `client`
   VM running the module. The script looks every name up both directly
-  against the resolver (`dig`) and through glibc (`getent ahosts`), and
-  checks the daemon's verdicts over its socket as different users. See
+  against the resolver (`dig`) and through glibc (`getent ahosts`, also
+  as different users via `runuser`), and checks the daemon's verdicts
+  over its socket. Specialisations switch the client to a default-deny
+  policy and to the other front-ends mid-test; they are reached through
+  the base system's store path, since `/run/current-system` moves. See
   "NixOS test" below for running it in the sandbox.
 - The devshell (`nix develop`, `menu`) provides the Rust toolchain, the
   treefmt wrapper, git, python3 and `flake-inputs-via-git` as a command.
