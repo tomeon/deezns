@@ -21,7 +21,7 @@
   };
 
   outputs = inputs @ {flake-parts, ...}:
-    flake-parts.lib.mkFlake {inherit inputs;} {
+    flake-parts.lib.mkFlake {inherit inputs;} ({config, ...}: {
       imports = [
         inputs.devshell.flakeModule
         inputs.treefmt-nix.flakeModule
@@ -34,6 +34,11 @@
         "aarch64-linux"
       ];
 
+      flake.nixosModules = {
+        deezns.imports = [./nix/module.nix];
+        default = config.flake.nixosModules.deezns;
+      };
+
       perSystem = {
         config,
         pkgs,
@@ -42,7 +47,24 @@
         packages = {
           deezns = pkgs.callPackage ./nix/package.nix {};
           default = config.packages.deezns;
+
+          # nixpkgs' nsncd with a prototype patch that lets NSS modules loaded
+          # into it learn the credentials of the process whose lookup they
+          # are serving (see the patch header).  Not used by the NixOS module
+          # yet.
+          nsncd = pkgs.nsncd.overrideAttrs (previous: {
+            patches = (previous.patches or []) ++ [./nix/nsncd-peer-cred.patch];
+          });
         };
+
+        # The VM test boots two machines (a resolver and a deezns client),
+        # so it needs KVM, or a builder that declares the `kvm` feature and
+        # lets QEMU fall back to emulation.  See "NixOS test" in AGENTS.md.
+        checks.nixos-test = pkgs.testers.runNixOSTest ./nix/test.nix;
+
+        # The module's assertions, evaluated against accepted and refused
+        # configurations; nothing is built.
+        checks.module-assertions = pkgs.callPackage ./nix/module-tests.nix {};
 
         treefmt = {
           projectRootFile = "flake.nix";
@@ -95,5 +117,5 @@
           ];
         };
       };
-    };
+    });
 }

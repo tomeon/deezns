@@ -57,6 +57,7 @@ use crate::blocklist::Blocklist;
 use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -101,6 +102,37 @@ pub struct BlocklistConfig {
     pub path: PathBuf,
 }
 
+/// The nscd-protocol front-end (see `nscd.rs`): deezns answers on the socket
+/// glibc's nscd client uses, applies the policy to host lookups with the
+/// real caller's credentials, and forwards everything else to the actual
+/// nscd listening at `upstream`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NscdFrontendConfig {
+    /// Where to listen; glibc looks at `/var/run/nscd/socket`.
+    pub listen: PathBuf,
+    /// The real nscd (nsncd's `NSNCD_SOCKET_PATH`) that serves everything
+    /// deezns does not answer itself.
+    pub upstream: PathBuf,
+}
+
+/// The DNS front-end (see `dns.rs`): deezns answers DNS on a loopback
+/// address, identifies callers from their sockets, and forwards what it does
+/// not answer itself to `upstream`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsFrontendConfig {
+    /// Address and port to serve DNS on, over UDP and TCP.
+    pub listen: SocketAddr,
+    /// The real DNS server for names the policy lets through.
+    pub upstream: SocketAddr,
+    /// How long to wait for the upstream before answering SERVFAIL.
+    #[serde(default = "default_upstream_timeout_ms")]
+    pub upstream_timeout_ms: u64,
+}
+
+fn default_upstream_timeout_ms() -> u64 {
+    5000
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_passthrough")]
@@ -111,6 +143,79 @@ pub struct PolicyConfig {
 
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+
+    #[serde(default)]
+    pub nscd_frontend: Option<NscdFrontendConfig>,
+
+    #[serde(default)]
+    pub dns_frontend: Option<DnsFrontendConfig>,
+}
+
+impl PolicyConfig {
+    /// Read and parse the configuration file.
+    pub fn from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&text)?)
+    }
+}
+
+/// The form a host name takes inside the policy: lower-case, without any
+/// trailing dot, so that `Blocked.Test.` and `blocked.test` are the same
+/// name.  The DNS root is `"."`.
+pub fn canonical_hostname(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let trimmed = lower.trim_end_matches('.');
+    if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Who is asking, as far as the daemon can tell.
+///
+/// `SO_PEERCRED` gives all three.  Front-ends that learn about the caller
+/// indirectly may know only the uid, or nothing at all; whatever is unknown
+/// is exposed to CEL as `-1`, which no real uid, gid or pid equals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    pub pid: Option<i32>,
+}
+
+impl Caller {
+    pub fn new(uid: u32, gid: u32, pid: i32) -> Self {
+        Caller {
+            uid: Some(uid),
+            gid: Some(gid),
+            pid: Some(pid),
+        }
+    }
+
+    /// A caller nothing is known about.
+    pub fn unknown() -> Self {
+        Caller {
+            uid: None,
+            gid: None,
+            pid: None,
+        }
+    }
+
+    /// The value a CEL rule sees for `uid`.
+    pub fn uid_value(&self) -> i64 {
+        self.uid.map_or(-1, i64::from)
+    }
+
+    /// The value a CEL rule sees for `gid`.
+    pub fn gid_value(&self) -> i64 {
+        self.gid.map_or(-1, i64::from)
+    }
+
+    /// The value a CEL rule sees for `pid`.
+    pub fn pid_value(&self) -> i64 {
+        self.pid.map_or(-1, i64::from)
+    }
 }
 
 fn default_passthrough() -> DefaultVerdict {
@@ -145,11 +250,9 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Load config, parse all blocklists, compile all CEL expressions.
-    pub fn load(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let text = std::fs::read_to_string(config_path)?;
-        let cfg: PolicyConfig = toml::from_str(&text)?;
-
+    /// Parse all blocklists and compile all CEL expressions of a parsed
+    /// configuration (see [`PolicyConfig::from_path`] for the file).
+    pub fn from_config(cfg: &PolicyConfig) -> Result<Self, Box<dyn std::error::Error>> {
         // Load blocklists.
         let mut blocklists = HashMap::new();
         for bl_cfg in &cfg.blocklists {
@@ -184,13 +287,19 @@ impl PolicyEngine {
         Ok(Self {
             rules,
             blocklists,
-            default_verdict: cfg.default_verdict,
+            default_verdict: cfg.default_verdict.clone(),
         })
     }
 
-    /// Evaluate the policy for a given query.
+    /// Evaluate the policy for a query from a fully identified caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn evaluate(&self, hostname: &str, uid: u32, gid: u32, pid: i32) -> PolicyVerdict {
-        let hostname_lower = hostname.to_ascii_lowercase();
+        self.evaluate_for(hostname, &Caller::new(uid, gid, pid))
+    }
+
+    /// Evaluate the policy for a given query.
+    pub fn evaluate_for(&self, hostname: &str, caller: &Caller) -> PolicyVerdict {
+        let hostname_lower = canonical_hostname(hostname);
 
         // Pre-compute blocklist membership so we can expose it as a
         // simple function to CEL.  The map is owned (not borrowed from
@@ -212,9 +321,9 @@ impl PolicyEngine {
             // Variables.
             ctx.add_variable("hostname", hostname_lower.clone())
                 .unwrap();
-            ctx.add_variable("uid", uid as i64).unwrap();
-            ctx.add_variable("gid", gid as i64).unwrap();
-            ctx.add_variable("pid", pid as i64).unwrap();
+            ctx.add_variable("uid", caller.uid_value()).unwrap();
+            ctx.add_variable("gid", caller.gid_value()).unwrap();
+            ctx.add_variable("pid", caller.pid_value()).unwrap();
 
             // blocked_by("list_name") → bool
             //
@@ -352,6 +461,138 @@ mod tests {
             engine.evaluate("example.com", 1000, 1000, 1),
             PolicyVerdict::PassThrough,
         );
+    }
+
+    #[test]
+    fn unknown_gid_and_pid_are_minus_one() {
+        let engine = engine_from_toml(
+            r#"
+            default_verdict = "deny"
+
+            [[rules]]
+            note = "gid known"
+            expr = "gid == 100"
+            verdict = "allow"
+
+            [[rules]]
+            note = "gid unknown"
+            expr = "gid == -1 && pid == -1"
+            verdict = "passthrough"
+        "#,
+        );
+
+        let known = Caller::new(1000, 100, 7);
+        assert_eq!(
+            engine.evaluate_for("a.test", &known),
+            PolicyVerdict::Allowed
+        );
+
+        let unknown = Caller {
+            uid: Some(1000),
+            gid: None,
+            pid: None,
+        };
+        assert_eq!(
+            engine.evaluate_for("a.test", &unknown),
+            PolicyVerdict::PassThrough
+        );
+        assert_eq!(unknown.uid_value(), 1000);
+        assert_eq!(unknown.gid_value(), -1);
+        assert_eq!(unknown.pid_value(), -1);
+
+        let nobody = Caller::unknown();
+        assert_eq!(nobody.uid_value(), -1);
+        assert_eq!(
+            engine.evaluate_for("a.test", &nobody),
+            PolicyVerdict::PassThrough
+        );
+    }
+
+    #[test]
+    fn dns_frontend_section_is_optional_with_a_default_timeout() {
+        let cfg: PolicyConfig = toml::from_str(r#"default_verdict = "deny""#).unwrap();
+        assert!(cfg.dns_frontend.is_none());
+
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+            [dns_frontend]
+            listen = "127.0.0.1:53"
+            upstream = "192.0.2.53:53"
+        "#,
+        )
+        .unwrap();
+        let front = cfg.dns_frontend.unwrap();
+        assert_eq!(front.listen, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            front.upstream,
+            "192.0.2.53:53".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(front.upstream_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn host_names_are_canonicalised_before_evaluation() {
+        assert_eq!(canonical_hostname("Blocked.Test."), "blocked.test");
+        assert_eq!(canonical_hostname("blocked.test.."), "blocked.test");
+        assert_eq!(canonical_hostname("."), ".");
+        assert_eq!(canonical_hostname(""), ".");
+
+        let engine = engine_from_toml(
+            r#"
+            default_verdict = "passthrough"
+
+            [[rules]]
+            note = "blocked"
+            expr = 'hostname == "blocked.test"'
+            verdict = "deny"
+
+            [[rules]]
+            note = "root"
+            expr = 'hostname == "."'
+            verdict = "deny"
+        "#,
+        );
+        let caller = Caller::new(1000, 1000, 1);
+        // Absolute names hit the same rules as relative ones.
+        assert!(matches!(
+            engine.evaluate_for("blocked.test.", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate_for("BLOCKED.TEST.", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        // The root is a name too, and can be denied.
+        assert!(matches!(
+            engine.evaluate_for(".", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate_for("", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert_eq!(
+            engine.evaluate_for("fine.test.", &caller),
+            PolicyVerdict::PassThrough
+        );
+    }
+
+    #[test]
+    fn nscd_frontend_section_is_optional() {
+        let cfg: PolicyConfig = toml::from_str(r#"default_verdict = "deny""#).unwrap();
+        assert!(cfg.nscd_frontend.is_none());
+
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+            [nscd_frontend]
+            listen = "/run/nscd/socket"
+            upstream = "/run/nsncd/socket"
+        "#,
+        )
+        .unwrap();
+        let front = cfg.nscd_frontend.unwrap();
+        assert_eq!(front.listen, PathBuf::from("/run/nscd/socket"));
+        assert_eq!(front.upstream, PathBuf::from("/run/nsncd/socket"));
     }
 
     #[test]

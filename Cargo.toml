@@ -22,3 +22,5 @@ tracing-subscriber = "0.3"
 thiserror = "2"
 toml = "0.8"
 cel-interpreter = { version = "0.10", features = ["regex"] }
+# /proc/net socket tables and /proc/<pid> for the DNS front-end.
+procfs = { version = "0.18", default-features = false }

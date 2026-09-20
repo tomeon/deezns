@@ -81,6 +81,11 @@ Plus all built-in CEL string methods: `endsWith`, `startsWith`, `contains`,
 
 Rules are evaluated in order; **first match wins**.
 
+Before evaluation the queried name is canonicalised: lower-cased and
+stripped of any trailing dot, so `Blocked.Test.` and `blocked.test` are
+the same name to every rule and blocklist. A query for the DNS root
+reaches the rules as `"."`.
+
 ### Blocklist formats
 
 The blocklist loader (`src/blocklist.rs`) auto-detects three formats:
@@ -159,6 +164,92 @@ curl -o /etc/deezns/lists/stevenblack-hosts.txt \
 RUST_LOG=info deezns-daemon
 ```
 
+## Running behind nscd
+
+On systems where glibc routes lookups through nscd, which includes every
+NixOS system (it runs [nsncd](https://github.com/twosigma/nsncd) and
+loads third-party NSS modules only there), an NSS module never sees the
+process that asked: the module runs inside nscd, so `SO_PEERCRED` on the
+daemon's socket reports nscd's uid, gid and pid for every lookup.
+
+The daemon can instead take nscd's place on the wire. With an
+`[nscd_frontend]` section in the policy it listens on the socket glibc's
+client uses, applies the policy to host requests (`GETAI`,
+`GETHOSTBYNAME`, `GETHOSTBYNAMEv6`) with the credentials of the process
+that connected, and forwards everything else, passwd and group lookups
+included, byte for byte to the real nscd on another socket:
+
+```toml
+[nscd_frontend]
+listen = "/run/nscd/socket"      # where glibc looks (_PATH_NSCDSOCKET)
+upstream = "/run/nsncd/socket"   # nsncd, started with NSNCD_SOCKET_PATH
+```
+
+In this mode the NSS module and the `deezns` line in `nsswitch.conf`
+are not needed; an allowed name is resolved by nscd through the normal
+`files` and `dns` sources. Denials are answered as "host not found"
+(never as "database not served", which would make glibc bypass nscd
+for its next hundred lookups). Whatever the real nscd sends back for a
+host lookup is checked to be a complete, well-formed reply before it is
+relayed; an nscd that is unreachable, silent, slow or answers "not
+served" yields a temporary failure instead, so the client keeps using
+nscd. Other requests fall back to glibc's built-in sources. Reverse
+lookups carry an address rather than a name and are forwarded
+unfiltered. The socket is world-connectable, so the work is bounded:
+at most 512 connections at once, five seconds for a client to send its
+request and for nscd to answer, and a failed `accept()` is retried
+rather than fatal.
+
+## Running as the local DNS server
+
+The third front-end sidesteps NSS altogether. With a `[dns_frontend]`
+section the daemon serves DNS on a loopback address, over UDP and TCP;
+point `/etc/resolv.conf` at it and every resolver on the machine goes
+through the policy, glibc's `dns` source and programs with their own DNS
+client (browsers, Go binaries) alike:
+
+```toml
+[dns_frontend]
+listen = "127.0.0.1:53"
+upstream = "192.0.2.53:53"   # the real resolver
+upstream_timeout_ms = 5000   # optional
+```
+
+A DNS query carries no credentials, so the caller is read off the socket
+it came from: `/proc/net/udp`, `/proc/net/udp6`, `/proc/net/tcp` and
+`/proc/net/tcp6` list every local socket with its owner's uid and its
+inode, readable by anyone. The socket is matched on the whole
+connection (the client's address and port and the server address it
+sent to), both tables are searched whatever the client's address family
+(a dual-stack IPv6 socket talking to an IPv4 listener appears in the
+IPv6 table with an IPv4-mapped address), and when sockets of different
+users fit equally well nobody is identified. Turning the inode into a
+process, and so into
+a `gid` and `pid`, means finding it under `/proc/<pid>/fd`. For another
+user's process that takes two capabilities: `CAP_DAC_READ_SEARCH` to
+list the fd directory (it is mode 0500 and owned by that user) and
+`CAP_SYS_PTRACE` to follow its links, the same reason `ss -p` wants
+root. Without them the daemon says so once at startup and rules see
+`gid == -1` and `pid == -1`. `uid` is `-1` only when no local socket
+matches the query, which does not happen for queries from this machine.
+
+Denied names get NXDOMAIN, the daemon's own records are answered
+directly, and everything else is forwarded verbatim to the upstream
+server over the transport the client used; an upstream that does not
+answer within the timeout yields SERVFAIL. Only the question section is
+interpreted, so every record type and EDNS pass through untouched; a
+query for the root is judged like any other, under the name `"."`. The
+listeners are world-reachable, so the work is bounded: at most 512 TCP
+connections and in-flight UDP queries at once, five seconds for a TCP
+client to send its query, and a failed `accept()` is retried rather
+than fatal.
+
+This mode does not combine with systemd-resolved: its stub resolver
+would sit between the applications and the daemon, so every query
+would identify `systemd-resolved` rather than the program that asked,
+and its cache would be shared across users. The NixOS module refuses
+that combination.
+
 ## Compile-time options
 
 | Environment variable | Default                    | Purpose          |
@@ -166,6 +257,18 @@ RUST_LOG=info deezns-daemon
 | `DEEZNS_SOCKET_PATH` | `/run/deezns/resolve.sock` | Unix socket path |
 
 Set at build time: `DEEZNS_SOCKET_PATH=/my/path cargo build`
+
+The socket path is a compile-time option rather than a runtime one
+because of the NSS module. glibc loads `libnss_deezns.so.2` into
+whatever process happens to call `getaddrinfo()` and gives it nothing
+but the name to look up: NSS has no configuration mechanism of its own
+(`/etc/nsswitch.conf` only names the modules and their actions), the
+module cannot take command-line arguments, and it cannot rely on
+environment variables, which are unset for setuid programs and system
+services and would differ from process to process anyway. So the path
+has to live inside the shared object itself. `build.rs` bakes the same
+value into the daemon so the two sides can never disagree; moving the
+socket means rebuilding both.
 
 ## Future directions
 

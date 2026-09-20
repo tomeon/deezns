@@ -7,6 +7,29 @@
 #   "deny"        = NXDOMAIN everything not explicitly allowed
 default_verdict = "deny"
 
+# ── nscd front-end (optional) ─────────────────────────────────────────
+# On systems where glibc sends every lookup to nscd (NixOS, or any host
+# running nscd/nsncd), the NSS module only ever sees nscd's credentials.
+# Uncomment to have the daemon answer on nscd's socket instead, applying
+# the policy to host lookups with the real caller's credentials and
+# forwarding everything else to the actual nscd; see "Running behind
+# nscd" in README.md.
+#
+# [nscd_frontend]
+# listen = "/run/nscd/socket"
+# upstream = "/run/nsncd/socket"
+
+# ── DNS front-end (optional) ──────────────────────────────────────────
+# Serve DNS on loopback and point resolv.conf here; callers are
+# identified from their sockets (uid always; gid and pid only with
+# CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE, otherwise -1).  See "Running
+# as the local DNS server"
+# in README.md.
+#
+# [dns_frontend]
+# listen = "127.0.0.1:53"
+# upstream = "192.0.2.53:53"
+
 # ── External blocklists ───────────────────────────────────────────────
 # Loaded at startup.  Supports hosts-file, domains-only, and AdBlock
 # (||domain^) formats.  Referenced in CEL via blocked_by("name").

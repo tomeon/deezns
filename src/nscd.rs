@@ -1,0 +1,1122 @@
+//! nscd-protocol front-end.
+//!
+//! On systems where every lookup goes through nscd's socket (NixOS runs
+//! nsncd, and glibc consults `/var/run/nscd/socket` before doing anything
+//! itself), an NSS module only ever meets nscd's credentials.  This
+//! front-end takes nscd's place: it listens where glibc's client looks,
+//! reads `SO_PEERCRED` of the process that actually asked, applies the
+//! policy to host requests, and forwards everything else, byte for byte, to
+//! the real nscd on another socket.
+//!
+//! The wire protocol is glibc's nscd protocol, version 2
+//! (`nscd/nscd-client.h`): a 12-byte request header (version, type and key
+//! length as native-endian `int32`) followed by the key, one request per
+//! connection; the reply is a type-specific header followed by data, after
+//! which the server closes the connection.
+//!
+//! Replying deserves care.  For host requests a reply with `found == -1`
+//! tells glibc that the daemon does not serve the database, after which the
+//! client does its next hundred lookups in-process, unfiltered; a closed
+//! connection means the same.  A denial is therefore `found == 0` with
+//! `error == HOST_NOT_FOUND`, and an unreachable, silent or malformed
+//! upstream becomes `found == 0` with `error == TRY_AGAIN`: whatever the
+//! real nscd sends back for a host request is checked to be a complete,
+//! well-formed positive or negative reply before it is relayed.  Non-host
+//! requests that cannot be forwarded are answered by closing the
+//! connection on purpose: glibc then serves that lookup from its built-in
+//! sources.
+//!
+//! The socket is world-connectable, so the work is bounded: at most
+//! `max_connections` connections at once, a deadline for the client to send
+//! its request and for the upstream to answer, and `accept()` failures
+//! (file descriptor exhaustion, say) are logged and retried rather than
+//! taking the front-end down.
+
+use crate::peercred::peer_caller;
+use crate::policy::{Caller, NscdFrontendConfig, PolicyEngine, PolicyVerdict};
+use crate::upstream::upstream_resolve;
+
+use std::io;
+use std::net::IpAddr;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use tracing::{debug, error, info, warn};
+
+/// The only protocol version glibc has ever spoken.
+pub const VERSION: i32 = 2;
+/// Longest key nscd accepts (`MAXKEYLEN` in `nscd/nscd.h`).
+pub const MAX_KEY_LEN: usize = 1024;
+/// Size of `request_header`.
+const HEADER_LEN: usize = 12;
+
+// `h_errno` values (netdb.h).
+pub const HOST_NOT_FOUND: i32 = 1;
+pub const TRY_AGAIN: i32 = 2;
+pub const NO_DATA: i32 = 4;
+
+/// Sizes of `ai_response_header` and `hst_response_header`.
+const AI_HEADER_LEN: usize = 24;
+const HST_HEADER_LEN: usize = 32;
+
+/// Concurrent connections at most.
+const DEFAULT_MAX_CONNECTIONS: usize = 512;
+/// How long a client may take to send its request.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the real nscd may take to answer.
+const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause after a failed accept(), typically from descriptor exhaustion.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
+
+/// `request_type` from `nscd/nscd-client.h`, in declaration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestType {
+    GetPwByName,
+    GetPwByUid,
+    GetGrByName,
+    GetGrByGid,
+    GetHostByName,
+    GetHostByNameV6,
+    GetHostByAddr,
+    GetHostByAddrV6,
+    Shutdown,
+    GetStat,
+    Invalidate,
+    GetFdPw,
+    GetFdGr,
+    GetFdHst,
+    GetAi,
+    InitGroups,
+    GetServByName,
+    GetServByPort,
+    GetFdServ,
+    GetNetGrEnt,
+    InNetGr,
+    GetFdNetGr,
+}
+
+impl RequestType {
+    const ALL: [RequestType; 22] = [
+        RequestType::GetPwByName,
+        RequestType::GetPwByUid,
+        RequestType::GetGrByName,
+        RequestType::GetGrByGid,
+        RequestType::GetHostByName,
+        RequestType::GetHostByNameV6,
+        RequestType::GetHostByAddr,
+        RequestType::GetHostByAddrV6,
+        RequestType::Shutdown,
+        RequestType::GetStat,
+        RequestType::Invalidate,
+        RequestType::GetFdPw,
+        RequestType::GetFdGr,
+        RequestType::GetFdHst,
+        RequestType::GetAi,
+        RequestType::InitGroups,
+        RequestType::GetServByName,
+        RequestType::GetServByPort,
+        RequestType::GetFdServ,
+        RequestType::GetNetGrEnt,
+        RequestType::InNetGr,
+        RequestType::GetFdNetGr,
+    ];
+
+    pub fn from_i32(value: i32) -> Option<Self> {
+        usize::try_from(value)
+            .ok()
+            .and_then(|i| Self::ALL.get(i).copied())
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn as_i32(self) -> i32 {
+        Self::ALL.iter().position(|&t| t == self).unwrap() as i32
+    }
+
+    /// Requests whose key is a host name the policy applies to.  Reverse
+    /// lookups carry an address, not a name, and are forwarded untouched.
+    pub fn is_host_lookup(self) -> bool {
+        matches!(
+            self,
+            RequestType::GetHostByName | RequestType::GetHostByNameV6 | RequestType::GetAi
+        )
+    }
+}
+
+/// One request as received: parsed enough to route it, and kept verbatim
+/// so it can be forwarded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
+    pub ty: RequestType,
+    pub key: Vec<u8>,
+    pub raw: Vec<u8>,
+}
+
+impl Request {
+    /// Serialize a request the way glibc's client does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn encode(ty: RequestType, key: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(HEADER_LEN + key.len());
+        bytes.extend_from_slice(&VERSION.to_ne_bytes());
+        bytes.extend_from_slice(&ty.as_i32().to_ne_bytes());
+        bytes.extend_from_slice(&(key.len() as i32).to_ne_bytes());
+        bytes.extend_from_slice(key);
+        bytes
+    }
+
+    /// Parse a complete request (header and key).
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() < HEADER_LEN {
+            return Err(format!("request too short: {} bytes", bytes.len()));
+        }
+        let int = |at: usize| i32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+        let version = int(0);
+        if version != VERSION {
+            return Err(format!("unsupported protocol version {version}"));
+        }
+        let ty = RequestType::from_i32(int(4))
+            .ok_or_else(|| format!("unknown request type {}", int(4)))?;
+        let key_len = usize::try_from(int(8)).map_err(|_| "negative key length".to_string())?;
+        if key_len > MAX_KEY_LEN {
+            return Err(format!("key length {key_len} exceeds {MAX_KEY_LEN}"));
+        }
+        if bytes.len() != HEADER_LEN + key_len {
+            return Err(format!(
+                "key length {key_len} does not match {} bytes of key",
+                bytes.len() - HEADER_LEN
+            ));
+        }
+        Ok(Request {
+            ty,
+            key: bytes[HEADER_LEN..].to_vec(),
+            raw: bytes.to_vec(),
+        })
+    }
+
+    /// The key as a host name: NUL-terminated UTF-8 (glibc sends the
+    /// name including its terminator).
+    pub fn hostname(&self) -> Option<&str> {
+        let name = self.key.strip_suffix(b"\0").unwrap_or(&self.key);
+        std::str::from_utf8(name).ok().filter(|s| !s.is_empty())
+    }
+}
+
+async fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
+    let mut header = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header).await?;
+    let key_len = i32::from_ne_bytes(header[8..12].try_into().unwrap());
+    let key_len = usize::try_from(key_len)
+        .ok()
+        .filter(|&n| n <= MAX_KEY_LEN)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad key length"))?;
+    let mut raw = header.to_vec();
+    raw.resize(HEADER_LEN + key_len, 0);
+    stream.read_exact(&mut raw[HEADER_LEN..]).await?;
+    Request::parse(&raw).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+// ---------------------------------------------------------------------------
+// Replies (nscd/nscd-client.h)
+// ---------------------------------------------------------------------------
+
+fn push_i32(buf: &mut Vec<u8>, value: i32) {
+    buf.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn address_bytes(addr: &IpAddr) -> Vec<u8> {
+    match addr {
+        IpAddr::V4(a) => a.octets().to_vec(),
+        IpAddr::V6(a) => a.octets().to_vec(),
+    }
+}
+
+fn address_family(addr: &IpAddr) -> i32 {
+    match addr {
+        IpAddr::V4(_) => libc::AF_INET,
+        IpAddr::V6(_) => libc::AF_INET6,
+    }
+}
+
+/// `ai_response_header` (24 bytes) followed by the packed addresses, one
+/// family byte per address and the canonical name.
+fn ai_reply(found: i32, error: i32, canon: &str, addrs: &[IpAddr]) -> Vec<u8> {
+    let packed: Vec<u8> = addrs.iter().flat_map(address_bytes).collect();
+    let families: Vec<u8> = addrs.iter().map(|a| address_family(a) as u8).collect();
+    let canon_len = if found == 1 { canon.len() + 1 } else { 0 };
+
+    let mut buf = Vec::new();
+    push_i32(&mut buf, VERSION);
+    push_i32(&mut buf, found);
+    push_i32(&mut buf, addrs.len() as i32);
+    push_i32(&mut buf, packed.len() as i32);
+    push_i32(&mut buf, canon_len as i32);
+    push_i32(&mut buf, error);
+    if found == 1 {
+        buf.extend_from_slice(&packed);
+        buf.extend_from_slice(&families);
+        buf.extend_from_slice(canon.as_bytes());
+        buf.push(0);
+    }
+    buf
+}
+
+/// A negative `GETAI` reply that glibc reports to the caller as `error`
+/// (an `h_errno` value) rather than falling back to an in-process lookup.
+pub fn ai_not_found(error: i32) -> Vec<u8> {
+    ai_reply(0, error, "", &[])
+}
+
+/// A `GETAI` reply carrying the daemon's own addresses for `canon`.
+pub fn ai_found(canon: &str, addrs: &[IpAddr]) -> Vec<u8> {
+    ai_reply(1, 0, canon, addrs)
+}
+
+/// `hst_response_header` (32 bytes) followed by the name and the address
+/// list; the aliases count is always zero here.
+fn hst_reply(found: i32, error: i32, name: &str, family: i32, addrs: &[IpAddr]) -> Vec<u8> {
+    let length = if family == libc::AF_INET6 { 16 } else { 4 };
+    let mut buf = Vec::new();
+    push_i32(&mut buf, VERSION);
+    push_i32(&mut buf, found);
+    push_i32(&mut buf, if found == 1 { name.len() as i32 + 1 } else { 0 });
+    push_i32(&mut buf, 0);
+    push_i32(&mut buf, if found == 1 { family } else { -1 });
+    push_i32(&mut buf, if found == 1 { length } else { -1 });
+    push_i32(&mut buf, if found == 1 { addrs.len() as i32 } else { 0 });
+    push_i32(&mut buf, error);
+    if found == 1 {
+        buf.extend_from_slice(name.as_bytes());
+        buf.push(0);
+        for addr in addrs {
+            buf.extend_from_slice(&address_bytes(addr));
+        }
+    }
+    buf
+}
+
+/// A negative `GETHOSTBYNAME`/`GETHOSTBYNAMEv6` reply.
+pub fn hst_not_found(error: i32) -> Vec<u8> {
+    hst_reply(0, error, "", -1, &[])
+}
+
+/// A positive `GETHOSTBYNAME` (`AF_INET`) or `GETHOSTBYNAMEv6`
+/// (`AF_INET6`) reply with the addresses of that family, or `None` when
+/// there are none.
+pub fn hst_found(name: &str, family: i32, addrs: &[IpAddr]) -> Option<Vec<u8>> {
+    let matching: Vec<IpAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|a| address_family(a) == family)
+        .collect();
+    if matching.is_empty() {
+        None
+    } else {
+        Some(hst_reply(1, 0, name, family, &matching))
+    }
+}
+
+/// Whether `reply`, from the real nscd, is a complete positive or negative
+/// answer to a host request of type `ty`.  Anything else (nothing at all,
+/// a truncated body, `found == -1` for a database it does not serve) must
+/// not reach the client, which would take it as "no nscd here".
+pub fn valid_host_reply(ty: RequestType, reply: &[u8]) -> bool {
+    let int = |at: usize| {
+        reply
+            .get(at..at + 4)
+            .map(|b| i64::from(i32::from_ne_bytes(b.try_into().unwrap())))
+    };
+    let (Some(version), Some(found)) = (int(0), int(4)) else {
+        return false;
+    };
+    if version != i64::from(VERSION) {
+        return false;
+    }
+    let len = reply.len() as i64;
+    match ty {
+        RequestType::GetAi => {
+            if len < AI_HEADER_LEN as i64 {
+                return false;
+            }
+            match found {
+                0 => true,
+                1 => {
+                    let (Some(naddrs), Some(addrslen), Some(canonlen)) = (int(8), int(12), int(16))
+                    else {
+                        return false;
+                    };
+                    naddrs >= 0
+                        && addrslen >= 0
+                        && canonlen >= 0
+                        && len == AI_HEADER_LEN as i64 + naddrs + addrslen + canonlen
+                }
+                _ => false,
+            }
+        }
+        _ => {
+            if len < HST_HEADER_LEN as i64 {
+                return false;
+            }
+            match found {
+                0 => true,
+                1 => {
+                    let (Some(name_len), Some(aliases_cnt), Some(length), Some(addr_cnt)) =
+                        (int(8), int(12), int(20), int(24))
+                    else {
+                        return false;
+                    };
+                    // The alias strings follow the addresses with lengths
+                    // given inside the body, so only a lower bound is known.
+                    name_len >= 0
+                        && aliases_cnt >= 0
+                        && addr_cnt >= 0
+                        && (length == 4 || length == 16)
+                        && len
+                            >= HST_HEADER_LEN as i64
+                                + name_len
+                                + aliases_cnt * 4
+                                + addr_cnt * length
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
+fn not_found(ty: RequestType, error: i32) -> Vec<u8> {
+    match ty {
+        RequestType::GetAi => ai_not_found(error),
+        _ => hst_not_found(error),
+    }
+}
+
+fn found(ty: RequestType, name: &str, addrs: &[IpAddr]) -> Vec<u8> {
+    match ty {
+        RequestType::GetAi => ai_found(name, addrs),
+        RequestType::GetHostByName => {
+            hst_found(name, libc::AF_INET, addrs).unwrap_or_else(|| hst_not_found(NO_DATA))
+        }
+        _ => hst_found(name, libc::AF_INET6, addrs).unwrap_or_else(|| hst_not_found(NO_DATA)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The front-end
+// ---------------------------------------------------------------------------
+
+/// What to send back: bytes, or nothing before closing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply {
+    Bytes(Vec<u8>),
+    Close,
+}
+
+pub struct Frontend {
+    listen: PathBuf,
+    upstream: PathBuf,
+    read_timeout: Duration,
+    upstream_timeout: Duration,
+    slots: Arc<Semaphore>,
+    engine: Arc<PolicyEngine>,
+}
+
+impl Frontend {
+    pub fn new(config: &NscdFrontendConfig, engine: Arc<PolicyEngine>) -> Self {
+        Self::with_limits(
+            config,
+            engine,
+            DEFAULT_READ_TIMEOUT,
+            DEFAULT_UPSTREAM_TIMEOUT,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+    }
+
+    /// `new`, with the deadlines and the concurrency limit chosen.
+    pub fn with_limits(
+        config: &NscdFrontendConfig,
+        engine: Arc<PolicyEngine>,
+        read_timeout: Duration,
+        upstream_timeout: Duration,
+        max_connections: usize,
+    ) -> Self {
+        Frontend {
+            listen: config.listen.clone(),
+            upstream: config.upstream.clone(),
+            read_timeout,
+            upstream_timeout,
+            slots: Arc::new(Semaphore::new(max_connections)),
+            engine,
+        }
+    }
+
+    pub fn listen_path(&self) -> &std::path::Path {
+        &self.listen
+    }
+
+    /// Bind the listening socket, world-connectable like nscd's own.
+    pub fn bind(&self) -> io::Result<UnixListener> {
+        if self.listen.exists() {
+            std::fs::remove_file(&self.listen)?;
+        }
+        if let Some(parent) = self.listen.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let listener = UnixListener::bind(&self.listen)?;
+        std::fs::set_permissions(&self.listen, std::fs::Permissions::from_mode(0o666))?;
+        Ok(listener)
+    }
+
+    pub async fn serve(self: Arc<Self>, listener: UnixListener) -> io::Result<()> {
+        loop {
+            let slot = Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(%e, "nscd accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+            };
+            let front = Arc::clone(&self);
+            tokio::spawn(async move {
+                let _slot = slot;
+                if let Err(e) = front.handle(stream).await {
+                    debug!(%e, "nscd connection ended with error");
+                }
+            });
+        }
+    }
+
+    async fn handle(&self, mut stream: UnixStream) -> io::Result<()> {
+        let caller = peer_caller(&stream)?;
+        let request = match tokio::time::timeout(self.read_timeout, read_request(&mut stream)).await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                warn!(%e, peer.uid = caller.uid_value(), "bad nscd request");
+                return Ok(());
+            }
+            Err(_) => {
+                debug!(
+                    peer.uid = caller.uid_value(),
+                    "nscd client sent no request in time; closing"
+                );
+                return Ok(());
+            }
+        };
+        match self.reply_for(&request, &caller).await {
+            Reply::Bytes(bytes) => stream.write_all(&bytes).await?,
+            Reply::Close => {}
+        }
+        stream.shutdown().await
+    }
+
+    /// Decide what a request gets: an answer of our own, or the upstream's.
+    pub async fn reply_for(&self, request: &Request, caller: &Caller) -> Reply {
+        if !request.ty.is_host_lookup() {
+            return match self.forward(request).await {
+                Ok(bytes) => Reply::Bytes(bytes),
+                Err(e) => {
+                    warn!(%e, request = ?request.ty, "upstream nscd unreachable, closing");
+                    Reply::Close
+                }
+            };
+        }
+
+        let Some(hostname) = request.hostname() else {
+            warn!(request = ?request.ty, "host request without a name");
+            return Reply::Close;
+        };
+
+        match self.engine.evaluate_for(hostname, caller) {
+            PolicyVerdict::Denied(reason) => {
+                info!(
+                    hostname,
+                    peer.uid = caller.uid_value(),
+                    peer.gid = caller.gid_value(),
+                    peer.pid = caller.pid_value(),
+                    %reason,
+                    "DENIED"
+                );
+                Reply::Bytes(not_found(request.ty, HOST_NOT_FOUND))
+            }
+            PolicyVerdict::PassThrough => {
+                info!(
+                    hostname,
+                    peer.uid = caller.uid_value(),
+                    peer.gid = caller.gid_value(),
+                    peer.pid = caller.pid_value(),
+                    "PASSTHROUGH"
+                );
+                self.forward_host(request).await
+            }
+            PolicyVerdict::Allowed => {
+                let addrs = upstream_resolve(hostname).await;
+                if addrs.is_empty() {
+                    info!(
+                        hostname,
+                        peer.uid = caller.uid_value(),
+                        peer.gid = caller.gid_value(),
+                        peer.pid = caller.pid_value(),
+                        "ALLOWED (no local records, forwarding to nscd)"
+                    );
+                    self.forward_host(request).await
+                } else {
+                    info!(
+                        hostname,
+                        peer.uid = caller.uid_value(),
+                        peer.gid = caller.gid_value(),
+                        peer.pid = caller.pid_value(),
+                        count = addrs.len(),
+                        "RESOLVED"
+                    );
+                    Reply::Bytes(found(request.ty, hostname, &addrs))
+                }
+            }
+        }
+    }
+
+    async fn forward_host(&self, request: &Request) -> Reply {
+        match self.forward(request).await {
+            Ok(bytes) if valid_host_reply(request.ty, &bytes) => Reply::Bytes(bytes),
+            Ok(bytes) => {
+                error!(
+                    len = bytes.len(),
+                    request = ?request.ty,
+                    "upstream nscd sent no usable host reply, answering TRY_AGAIN"
+                );
+                Reply::Bytes(not_found(request.ty, TRY_AGAIN))
+            }
+            Err(e) => {
+                error!(%e, "upstream nscd unreachable, answering TRY_AGAIN");
+                Reply::Bytes(not_found(request.ty, TRY_AGAIN))
+            }
+        }
+    }
+
+    /// Send the request verbatim to the real nscd and collect its reply,
+    /// within the upstream deadline.
+    async fn forward(&self, request: &Request) -> io::Result<Vec<u8>> {
+        tokio::time::timeout(self.upstream_timeout, async {
+            let mut upstream = UnixStream::connect(&self.upstream).await?;
+            upstream.write_all(&request.raw).await?;
+            let mut reply = Vec::new();
+            upstream.read_to_end(&mut reply).await?;
+            Ok(reply)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "upstream nscd did not answer in time",
+            ))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::PolicyConfig;
+
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    fn ints(bytes: &[u8]) -> Vec<i32> {
+        let (words, rest) = bytes.as_chunks::<4>();
+        assert!(rest.is_empty(), "not a whole number of int32s");
+        words.iter().map(|w| i32::from_ne_bytes(*w)).collect()
+    }
+
+    #[test]
+    fn request_types_round_trip_in_declaration_order() {
+        assert_eq!(RequestType::from_i32(0), Some(RequestType::GetPwByName));
+        assert_eq!(RequestType::from_i32(4), Some(RequestType::GetHostByName));
+        assert_eq!(RequestType::from_i32(14), Some(RequestType::GetAi));
+        assert_eq!(RequestType::from_i32(21), Some(RequestType::GetFdNetGr));
+        assert_eq!(RequestType::from_i32(22), None);
+        assert_eq!(RequestType::from_i32(-1), None);
+        for ty in RequestType::ALL {
+            assert_eq!(RequestType::from_i32(ty.as_i32()), Some(ty));
+        }
+        assert!(RequestType::GetAi.is_host_lookup());
+        assert!(RequestType::GetHostByNameV6.is_host_lookup());
+        assert!(!RequestType::GetHostByAddr.is_host_lookup());
+        assert!(!RequestType::GetPwByName.is_host_lookup());
+    }
+
+    #[test]
+    fn requests_parse_and_encode() {
+        let raw = Request::encode(RequestType::GetAi, b"Example.Test\0");
+        assert_eq!(ints(&raw[..12]), vec![2, 14, 13]);
+        let request = Request::parse(&raw).unwrap();
+        assert_eq!(request.ty, RequestType::GetAi);
+        assert_eq!(request.hostname(), Some("Example.Test"));
+        assert_eq!(request.raw, raw);
+
+        let mut bad_version = raw.clone();
+        bad_version[..4].copy_from_slice(&1i32.to_ne_bytes());
+        assert!(Request::parse(&bad_version)
+            .unwrap_err()
+            .contains("version"));
+
+        let mut bad_type = raw.clone();
+        bad_type[4..8].copy_from_slice(&99i32.to_ne_bytes());
+        assert!(Request::parse(&bad_type).unwrap_err().contains("type"));
+
+        let too_long = Request::encode(RequestType::GetAi, &vec![b'a'; MAX_KEY_LEN + 1]);
+        assert!(Request::parse(&too_long).unwrap_err().contains("exceeds"));
+
+        assert!(Request::parse(&raw[..11]).is_err());
+        assert!(Request::parse(&raw[..raw.len() - 1]).is_err());
+
+        let empty = Request::parse(&Request::encode(RequestType::GetAi, b"\0")).unwrap();
+        assert_eq!(empty.hostname(), None);
+    }
+
+    #[test]
+    fn getai_replies_follow_nscd_layout() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let reply = ai_found("a.test", &[v4, v6]);
+        assert_eq!(ints(&reply[..24]), vec![2, 1, 2, 20, 7, 0]);
+        let mut expected = vec![1, 2, 3, 4];
+        expected.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        expected.extend_from_slice(&[libc::AF_INET as u8, libc::AF_INET6 as u8]);
+        expected.extend_from_slice(b"a.test\0");
+        assert_eq!(&reply[24..], &expected[..]);
+
+        let denied = ai_not_found(HOST_NOT_FOUND);
+        assert_eq!(ints(&denied), vec![2, 0, 0, 0, 0, HOST_NOT_FOUND]);
+        assert_eq!(ints(&ai_not_found(TRY_AGAIN))[5], TRY_AGAIN);
+    }
+
+    #[test]
+    fn gethostbyname_replies_follow_nscd_layout() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+
+        let reply = hst_found("a.test", libc::AF_INET, &[v4, v6]).unwrap();
+        assert_eq!(ints(&reply[..32]), vec![2, 1, 7, 0, libc::AF_INET, 4, 1, 0]);
+        assert_eq!(&reply[32..], b"a.test\0\x01\x02\x03\x04");
+
+        let reply = hst_found("a.test", libc::AF_INET6, &[v4, v6]).unwrap();
+        assert_eq!(
+            ints(&reply[..32]),
+            vec![2, 1, 7, 0, libc::AF_INET6, 16, 1, 0]
+        );
+        assert_eq!(&reply[39..], &Ipv6Addr::LOCALHOST.octets()[..]);
+
+        assert_eq!(hst_found("a.test", libc::AF_INET6, &[v4]), None);
+        assert_eq!(
+            ints(&hst_not_found(HOST_NOT_FOUND)),
+            vec![2, 0, 0, 0, -1, -1, 0, HOST_NOT_FOUND]
+        );
+        assert_eq!(
+            ints(&found(RequestType::GetHostByNameV6, "a.test", &[v4]))[7],
+            NO_DATA
+        );
+    }
+
+    // ── Integration: a front-end, a fake upstream and a client ────────────
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn temp_socket(tag: &str) -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        std::env::temp_dir().join(format!("deezns-{}-{n}-{tag}.sock", std::process::id()))
+    }
+
+    /// Records every request it receives and answers each with `reply`.
+    struct FakeUpstream {
+        path: PathBuf,
+        seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl FakeUpstream {
+        async fn start(reply: &'static [u8]) -> Self {
+            Self::start_with(reply.to_vec()).await
+        }
+
+        async fn start_with(reply: Vec<u8>) -> Self {
+            let path = temp_socket("upstream");
+            let listener = UnixListener::bind(&path).unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let seen_by_server = Arc::clone(&seen);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buf = vec![0; 4096];
+                    let n = stream.read(&mut buf).await.unwrap();
+                    seen_by_server.lock().unwrap().push(buf[..n].to_vec());
+                    stream.write_all(&reply).await.unwrap();
+                    stream.shutdown().await.unwrap();
+                }
+            });
+            FakeUpstream { path, seen }
+        }
+
+        fn seen(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    const TEST_TIMEOUT: Duration = Duration::from_millis(300);
+    const TEST_MAX_CONNECTIONS: usize = 4;
+
+    async fn start_frontend(policy: &str, upstream: &std::path::Path) -> Arc<Frontend> {
+        let cfg: PolicyConfig = toml::from_str(policy).unwrap();
+        let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
+        let front = Arc::new(Frontend::with_limits(
+            &NscdFrontendConfig {
+                listen: temp_socket("front"),
+                upstream: upstream.to_path_buf(),
+            },
+            engine,
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            TEST_MAX_CONNECTIONS,
+        ));
+        let listener = front.bind().unwrap();
+        tokio::spawn(Arc::clone(&front).serve(listener));
+        front
+    }
+
+    /// Send one request and collect the reply; a connection the front-end
+    /// closes (or resets, when it stops reading early) yields nothing.
+    async fn ask(front: &Frontend, request: Vec<u8>) -> Vec<u8> {
+        let mut stream = UnixStream::connect(front.listen_path()).await.unwrap();
+        stream.write_all(&request).await.unwrap();
+        let mut reply = Vec::new();
+        if stream.read_to_end(&mut reply).await.is_err() {
+            reply.clear();
+        }
+        reply
+    }
+
+    /// A well-formed positive GETAI reply, as the real nscd would send for
+    /// a name it resolved.
+    fn canned() -> Vec<u8> {
+        ai_found("canned.test", &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))])
+    }
+
+    fn policy_for_this_user() -> String {
+        format!(
+            r#"
+            default_verdict = "passthrough"
+
+            [[rules]]
+            note = "blocked"
+            expr = 'hostname == "blocked.test"'
+            verdict = "deny"
+
+            [[rules]]
+            note = "mine"
+            expr = 'uid == {uid} && gid == {gid} && pid == {pid} && hostname == "mine.test"'
+            verdict = "allow"
+
+            [[rules]]
+            note = "not mine"
+            expr = 'hostname == "mine.test"'
+            verdict = "deny"
+
+            [[rules]]
+            note = "daemon record"
+            expr = 'hostname == "example.local"'
+            verdict = "allow"
+            "#,
+            uid = unsafe { libc::geteuid() },
+            gid = unsafe { libc::getegid() },
+            pid = std::process::id(),
+        )
+    }
+
+    #[tokio::test]
+    async fn denials_are_answered_without_asking_upstream() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"blocked.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(HOST_NOT_FOUND));
+
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByName, b"BLOCKED.test\0"),
+        )
+        .await;
+        assert_eq!(reply, hst_not_found(HOST_NOT_FOUND));
+
+        assert!(upstream.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn passthrough_and_other_requests_are_forwarded_verbatim() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        let getai = Request::encode(RequestType::GetAi, b"unlisted.test\0");
+        assert_eq!(ask(&front, getai.clone()).await, canned());
+
+        let getpw = Request::encode(RequestType::GetPwByName, b"alice\0");
+        assert_eq!(ask(&front, getpw.clone()).await, canned());
+
+        let byaddr = Request::encode(RequestType::GetHostByAddr, &[127, 0, 0, 1]);
+        assert_eq!(ask(&front, byaddr.clone()).await, canned());
+
+        assert_eq!(upstream.seen(), vec![getai, getpw, byaddr]);
+    }
+
+    #[tokio::test]
+    async fn the_callers_own_credentials_reach_the_policy() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        // We are the caller, so the uid/gid/pid rule matches and the name
+        // is allowed (and, having no local records, forwarded).
+        let reply = ask(&front, Request::encode(RequestType::GetAi, b"mine.test\0")).await;
+        assert_eq!(reply, canned());
+
+        // Directly: another caller gets the deny rule.
+        let request = Request::parse(&Request::encode(RequestType::GetAi, b"mine.test\0")).unwrap();
+        let someone_else = Caller::new(unsafe { libc::geteuid() } + 1, 0, 1);
+        assert_eq!(
+            front.reply_for(&request, &someone_else).await,
+            Reply::Bytes(ai_not_found(HOST_NOT_FOUND))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daemons_own_records_are_answered_directly() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+        let ten = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"example.local\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_found("example.local", &[ten]));
+
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByName, b"example.local\0"),
+        )
+        .await;
+        assert_eq!(
+            reply,
+            hst_found("example.local", libc::AF_INET, &[ten]).unwrap()
+        );
+
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByNameV6, b"example.local\0"),
+        )
+        .await;
+        assert_eq!(reply, hst_not_found(NO_DATA));
+
+        assert!(upstream.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_upstream_degrades_safely() {
+        let nowhere = temp_socket("nowhere");
+        let front = start_frontend(&policy_for_this_user(), &nowhere).await;
+
+        // Host lookups get a temporary failure, never a "no nscd" signal.
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(TRY_AGAIN));
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByName, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, hst_not_found(TRY_AGAIN));
+
+        // Denials still work without an upstream.
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"blocked.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(HOST_NOT_FOUND));
+
+        // Everything else: closed without a reply, so glibc serves it itself.
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetPwByName, b"alice\0"),
+        )
+        .await;
+        assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn host_replies_are_validated_before_relaying() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(valid_host_reply(
+            RequestType::GetAi,
+            &ai_found("a.test", &[v4])
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetAi,
+            &ai_not_found(HOST_NOT_FOUND)
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetHostByName,
+            &hst_found("a.test", libc::AF_INET, &[v4]).unwrap()
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetHostByNameV6,
+            &hst_not_found(NO_DATA)
+        ));
+
+        // Nothing, too little, a truncated body, or "not served".
+        assert!(!valid_host_reply(RequestType::GetAi, &[]));
+        assert!(!valid_host_reply(
+            RequestType::GetAi,
+            &ai_not_found(0)[..23]
+        ));
+        let mut truncated = ai_found("a.test", &[v4]);
+        truncated.pop();
+        assert!(!valid_host_reply(RequestType::GetAi, &truncated));
+        assert!(!valid_host_reply(
+            RequestType::GetAi,
+            &ai_reply(-1, 0, "", &[])
+        ));
+        assert!(!valid_host_reply(
+            RequestType::GetHostByName,
+            &hst_reply(-1, 0, "", -1, &[])
+        ));
+        let mut short = hst_found("a.test", libc::AF_INET, &[v4]).unwrap();
+        short.truncate(HST_HEADER_LEN + 3);
+        assert!(!valid_host_reply(RequestType::GetHostByName, &short));
+        let mut wrong_version = ai_not_found(0);
+        wrong_version[..4].copy_from_slice(&1i32.to_ne_bytes());
+        assert!(!valid_host_reply(RequestType::GetAi, &wrong_version));
+    }
+
+    #[tokio::test]
+    async fn a_silent_or_broken_upstream_never_reaches_the_client_as_is() {
+        // An upstream that closes without a word, as nsncd does for a
+        // database it is told to ignore.
+        let silent = FakeUpstream::start(b"").await;
+        let front = start_frontend(&policy_for_this_user(), &silent.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(TRY_AGAIN));
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByName, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, hst_not_found(TRY_AGAIN));
+        // Non-host requests are relayed as they are: glibc then serves them
+        // from its built-in sources.
+        assert!(ask(
+            &front,
+            Request::encode(RequestType::GetPwByName, b"alice\0")
+        )
+        .await
+        .is_empty());
+
+        // "Database not served" is turned into a temporary failure too.
+        let not_served = FakeUpstream::start_with(ai_reply(-1, 0, "", &[])).await;
+        let front = start_frontend(&policy_for_this_user(), &not_served.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(TRY_AGAIN));
+
+        // A well-formed reply passes through unchanged.
+        let ten = IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7));
+        let good = FakeUpstream::start_with(ai_found("unlisted.test", &[ten])).await;
+        let front = start_frontend(&policy_for_this_user(), &good.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_found("unlisted.test", &[ten]));
+    }
+
+    #[tokio::test]
+    async fn idle_clients_are_dropped_and_do_not_block_others() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        // Fill every slot with clients that send nothing.
+        let mut idle = Vec::new();
+        for _ in 0..TEST_MAX_CONNECTIONS {
+            idle.push(UnixStream::connect(front.listen_path()).await.unwrap());
+        }
+        // After the deadline the server closes them: a read sees EOF.
+        for mut stream in idle {
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(TEST_TIMEOUT * 4, stream.read(&mut buf))
+                .await
+                .expect("server closes idle connection")
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        // And service continues.
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, canned());
+    }
+
+    #[tokio::test]
+    async fn absolute_names_are_judged_like_relative_ones() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"blocked.test.\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(HOST_NOT_FOUND));
+        assert!(upstream.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_are_dropped() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        let mut bad_version = Request::encode(RequestType::GetAi, b"unlisted.test\0");
+        bad_version[..4].copy_from_slice(&1i32.to_ne_bytes());
+        assert!(ask(&front, bad_version).await.is_empty());
+
+        let mut huge_key = Request::encode(RequestType::GetAi, b"x\0");
+        huge_key[8..12].copy_from_slice(&(MAX_KEY_LEN as i32 + 1).to_ne_bytes());
+        assert!(ask(&front, huge_key).await.is_empty());
+
+        assert!(upstream.seen().is_empty());
+    }
+}

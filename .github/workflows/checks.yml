@@ -33,6 +33,15 @@ jobs:
             !/nix/var/nix/gc.lock
             !/nix/var/nix/db/big-lock
             !/nix/var/nix/db/reserved
+      # The NixOS VM test needs /dev/kvm inside the Nix build sandbox.  GitHub's
+      # Linux runners have KVM, but the device is only accessible to root; the
+      # udev rule opens it to the nixbld users.
+      # https://github.blog/changelog/2023-02-23-hardware-accelerated-android-virtualization-on-actions-linux-larger-hosted-runners/
+      - name: Enable KVM for the Nix build sandbox
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Install Nix
         uses: cachix/install-nix-action@v31
       - name: Run Nix flake checks
