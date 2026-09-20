@@ -159,6 +159,19 @@ impl PolicyConfig {
     }
 }
 
+/// The form a host name takes inside the policy: lower-case, without any
+/// trailing dot, so that `Blocked.Test.` and `blocked.test` are the same
+/// name.  The DNS root is `"."`.
+pub fn canonical_hostname(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    let trimmed = lower.trim_end_matches('.');
+    if trimmed.is_empty() {
+        ".".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Who is asking, as far as the daemon can tell.
 ///
 /// `SO_PEERCRED` gives all three.  Front-ends that learn about the caller
@@ -286,7 +299,7 @@ impl PolicyEngine {
 
     /// Evaluate the policy for a given query.
     pub fn evaluate_for(&self, hostname: &str, caller: &Caller) -> PolicyVerdict {
-        let hostname_lower = hostname.to_ascii_lowercase();
+        let hostname_lower = canonical_hostname(hostname);
 
         // Pre-compute blocklist membership so we can expose it as a
         // simple function to CEL.  The map is owned (not borrowed from
@@ -515,6 +528,53 @@ mod tests {
             "192.0.2.53:53".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(front.upstream_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn host_names_are_canonicalised_before_evaluation() {
+        assert_eq!(canonical_hostname("Blocked.Test."), "blocked.test");
+        assert_eq!(canonical_hostname("blocked.test.."), "blocked.test");
+        assert_eq!(canonical_hostname("."), ".");
+        assert_eq!(canonical_hostname(""), ".");
+
+        let engine = engine_from_toml(
+            r#"
+            default_verdict = "passthrough"
+
+            [[rules]]
+            note = "blocked"
+            expr = 'hostname == "blocked.test"'
+            verdict = "deny"
+
+            [[rules]]
+            note = "root"
+            expr = 'hostname == "."'
+            verdict = "deny"
+        "#,
+        );
+        let caller = Caller::new(1000, 1000, 1);
+        // Absolute names hit the same rules as relative ones.
+        assert!(matches!(
+            engine.evaluate_for("blocked.test.", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate_for("BLOCKED.TEST.", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        // The root is a name too, and can be denied.
+        assert!(matches!(
+            engine.evaluate_for(".", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert!(matches!(
+            engine.evaluate_for("", &caller),
+            PolicyVerdict::Denied(_)
+        ));
+        assert_eq!(
+            engine.evaluate_for("fine.test.", &caller),
+            PolicyVerdict::PassThrough
+        );
     }
 
     #[test]

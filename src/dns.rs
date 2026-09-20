@@ -12,7 +12,14 @@
 //! directly, and everything else is forwarded verbatim to the configured
 //! upstream server over the same transport the client used; an upstream
 //! that does not answer yields SERVFAIL.  Only the question section is
-//! interpreted, so any record type and EDNS pass through untouched.
+//! interpreted, so any record type and EDNS pass through untouched.  A
+//! query for the root is judged like any other, under the name `"."`.
+//!
+//! The listeners are world-reachable, so their work is bounded: at most
+//! `max_connections` TCP connections and in-flight UDP queries at once, a
+//! deadline for a TCP client to send its query, and `accept()` failures
+//! (file descriptor exhaustion, say) are logged and retried rather than
+//! taking the front-end down.
 
 use crate::identify::{identify, Transport};
 use crate::policy::{Caller, DnsFrontendConfig, PolicyEngine, PolicyVerdict};
@@ -25,6 +32,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 pub const TYPE_A: u16 = 1;
@@ -47,6 +55,12 @@ const HEADER_LEN: usize = 12;
 const MAX_MESSAGE: usize = 65535;
 /// TTL of the daemon's own answers.
 const ANSWER_TTL: u32 = 60;
+/// Concurrent TCP connections, and in-flight UDP queries, at most.
+const DEFAULT_MAX_CONNECTIONS: usize = 512;
+/// How long a TCP client may take to send a whole query.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause after a failed accept(), typically from descriptor exhaustion.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// The one question of a query, and where it ends in the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,15 +216,36 @@ pub struct Frontend {
     listen: SocketAddr,
     upstream: SocketAddr,
     timeout: Duration,
+    read_timeout: Duration,
+    tcp_slots: Arc<Semaphore>,
+    udp_slots: Arc<Semaphore>,
     engine: Arc<PolicyEngine>,
 }
 
 impl Frontend {
     pub fn new(config: &DnsFrontendConfig, engine: Arc<PolicyEngine>) -> Self {
+        Self::with_limits(
+            config,
+            engine,
+            DEFAULT_READ_TIMEOUT,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+    }
+
+    /// `new`, with the client deadline and concurrency limit chosen.
+    pub fn with_limits(
+        config: &DnsFrontendConfig,
+        engine: Arc<PolicyEngine>,
+        read_timeout: Duration,
+        max_connections: usize,
+    ) -> Self {
         Frontend {
             listen: config.listen,
             upstream: config.upstream,
             timeout: Duration::from_millis(config.upstream_timeout_ms),
+            read_timeout,
+            tcp_slots: Arc::new(Semaphore::new(max_connections)),
+            udp_slots: Arc::new(Semaphore::new(max_connections)),
             engine,
         }
     }
@@ -233,14 +268,22 @@ impl Frontend {
 
     async fn serve_udp(self: Arc<Self>, socket: UdpSocket) -> io::Result<()> {
         let socket = Arc::new(socket);
+        let server = socket.local_addr()?;
         let mut buf = vec![0u8; MAX_MESSAGE];
         loop {
+            // Wait for a slot before reading, so a flood queues in the
+            // socket buffer instead of in unbounded tasks.
+            let slot = Arc::clone(&self.udp_slots)
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
             let (n, peer) = socket.recv_from(&mut buf).await?;
             let message = buf[..n].to_vec();
             let front = Arc::clone(&self);
             let socket = Arc::clone(&socket);
             tokio::spawn(async move {
-                let reply = front.respond(&message, peer, Transport::Udp).await;
+                let _slot = slot;
+                let reply = front.respond(&message, peer, Transport::Udp, server).await;
                 if let Err(e) = socket.send_to(&reply, peer).await {
                     debug!(%e, %peer, "cannot send DNS reply");
                 }
@@ -250,9 +293,21 @@ impl Frontend {
 
     async fn serve_tcp(self: Arc<Self>, listener: TcpListener) -> io::Result<()> {
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let slot = Arc::clone(&self.tcp_slots)
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
+            let (stream, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(%e, "DNS TCP accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+            };
             let front = Arc::clone(&self);
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Err(e) = front.serve_tcp_connection(stream, peer).await {
                     debug!(%e, %peer, "DNS TCP connection ended with error");
                 }
@@ -260,22 +315,30 @@ impl Frontend {
         }
     }
 
-    /// Length-prefixed messages, as many as the client sends.
+    /// Length-prefixed messages, as many as the client sends, each within
+    /// the client deadline.
     async fn serve_tcp_connection(
         &self,
         mut stream: TcpStream,
         peer: SocketAddr,
     ) -> io::Result<()> {
+        let server = stream.local_addr()?;
         loop {
-            let mut len = [0u8; 2];
-            match stream.read_exact(&mut len).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(e) => return Err(e),
-            }
-            let mut message = vec![0u8; u16::from_be_bytes(len) as usize];
-            stream.read_exact(&mut message).await?;
-            let reply = self.respond(&message, peer, Transport::Tcp).await;
+            let message = match tokio::time::timeout(
+                self.read_timeout,
+                read_tcp_message(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(Some(message))) => message,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    debug!(%peer, "DNS TCP client sent no query in time; closing");
+                    return Ok(());
+                }
+            };
+            let reply = self.respond(&message, peer, Transport::Tcp, server).await;
             stream
                 .write_all(&(reply.len() as u16).to_be_bytes())
                 .await?;
@@ -283,8 +346,14 @@ impl Frontend {
         }
     }
 
-    /// The reply to one message from `peer`.
-    pub async fn respond(&self, raw: &[u8], peer: SocketAddr, transport: Transport) -> Vec<u8> {
+    /// The reply to one message from `peer`, received on `server`.
+    pub async fn respond(
+        &self,
+        raw: &[u8],
+        peer: SocketAddr,
+        transport: Transport,
+        server: SocketAddr,
+    ) -> Vec<u8> {
         let query = match Query::parse(raw) {
             Ok(q) => q,
             Err(e) => {
@@ -292,16 +361,17 @@ impl Frontend {
                 return formerr(raw);
             }
         };
-        // Root queries carry no name to judge.
-        if query.question.name.is_empty() {
-            return self.forward(&query, transport).await;
-        }
 
         // Reading /proc is blocking work.
-        let caller = tokio::task::spawn_blocking(move || identify(transport, peer))
+        let caller = tokio::task::spawn_blocking(move || identify(transport, peer, server))
             .await
             .unwrap_or_else(|_| Caller::unknown());
-        let hostname = query.question.name.as_str();
+        // The root has no labels; the policy knows it as ".".
+        let hostname = if query.question.name.is_empty() {
+            "."
+        } else {
+            query.question.name.as_str()
+        };
 
         match self.engine.evaluate_for(hostname, &caller) {
             PolicyVerdict::Denied(reason) => {
@@ -400,12 +470,26 @@ impl Frontend {
         let mut stream = TcpStream::connect(self.upstream).await?;
         stream.write_all(&(raw.len() as u16).to_be_bytes()).await?;
         stream.write_all(raw).await?;
-        let mut len = [0u8; 2];
-        stream.read_exact(&mut len).await?;
-        let mut reply = vec![0u8; u16::from_be_bytes(len) as usize];
-        stream.read_exact(&mut reply).await?;
-        Ok(reply)
+        read_tcp_message(&mut stream).await?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "upstream closed without a reply",
+            )
+        })
     }
+}
+
+/// One length-prefixed DNS message, or `None` at a clean end of stream.
+async fn read_tcp_message(stream: &mut TcpStream) -> io::Result<Option<Vec<u8>>> {
+    let mut len = [0u8; 2];
+    match stream.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let mut message = vec![0u8; u16::from_be_bytes(len) as usize];
+    stream.read_exact(&mut message).await?;
+    Ok(Some(message))
 }
 
 // ---------------------------------------------------------------------------
@@ -588,17 +672,18 @@ mod tests {
         }
     }
 
+    const TEST_READ_TIMEOUT: Duration = Duration::from_millis(300);
+    const TEST_MAX_CONNECTIONS: usize = 4;
+
     async fn start_frontend(policy: &str, upstream: SocketAddr) -> Arc<Frontend> {
         let cfg: PolicyConfig = toml::from_str(policy).unwrap();
         let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
-        let front = Arc::new(Frontend::new(
-            &DnsFrontendConfig {
-                listen: "127.0.0.1:0".parse().unwrap(),
-                upstream,
-                upstream_timeout_ms: 300,
-            },
-            engine,
-        ));
+        let config = DnsFrontendConfig {
+            listen: "127.0.0.1:0".parse().unwrap(),
+            upstream,
+            upstream_timeout_ms: 300,
+        };
+        let front = Frontend::with_limits(&config, engine, TEST_READ_TIMEOUT, TEST_MAX_CONNECTIONS);
         let (udp, tcp) = front.bind().await.unwrap();
         // Both sockets bound to port 0 get different ports; the test uses
         // the UDP one and connects TCP to the TCP one.
@@ -606,9 +691,7 @@ mod tests {
         let tcp_addr = tcp.local_addr().unwrap();
         let front = Arc::new(Frontend {
             listen: udp_addr,
-            upstream: front.upstream,
-            timeout: front.timeout,
-            engine: Arc::clone(&front.engine),
+            ..front
         });
         TCP_ADDR.with(|a| a.set(Some(tcp_addr)));
         tokio::spawn(Arc::clone(&front).serve(udp, tcp));
@@ -670,6 +753,11 @@ mod tests {
             note = "daemon record"
             expr = 'hostname == "example.local"'
             verdict = "allow"
+
+            [[rules]]
+            note = "root"
+            expr = 'hostname == "."'
+            verdict = "deny"
             "#,
             uid = unsafe { libc::geteuid() },
             gid = unsafe { libc::getegid() },
@@ -726,9 +814,53 @@ mod tests {
         let parsed = Query::parse(&query).unwrap();
         let unknown_peer: SocketAddr = "192.0.2.77:1".parse().unwrap();
         let reply = front
-            .respond(&parsed.raw, unknown_peer, Transport::Udp)
+            .respond(
+                &parsed.raw,
+                unknown_peer,
+                Transport::Udp,
+                front.listen_addr(),
+            )
             .await;
         assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn root_queries_are_judged_under_the_name_dot() {
+        let upstream = FakeUpstream::start().await;
+        let front = start_frontend(&policy_for_this_user(), upstream.addr).await;
+
+        let reply = ask_udp(&front, &build_query(20, ".", 2)).await;
+        assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+        assert!(upstream.seen().is_empty());
+
+        // Absolute names are the same names.
+        let reply = ask_udp(&front, &build_query(21, "blocked.test.", TYPE_A)).await;
+        assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn idle_tcp_clients_are_dropped_and_do_not_block_others() {
+        let upstream = FakeUpstream::start().await;
+        let _front = start_frontend(&policy_for_this_user(), upstream.addr).await;
+        let addr = TCP_ADDR.with(|a| a.get()).unwrap();
+
+        // Fill every slot with clients that send nothing.
+        let mut idle = Vec::new();
+        for _ in 0..TEST_MAX_CONNECTIONS {
+            idle.push(TcpStream::connect(addr).await.unwrap());
+        }
+        // After the deadline the server closes them: a read sees EOF.
+        for mut stream in idle {
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(TEST_READ_TIMEOUT * 4, stream.read(&mut buf))
+                .await
+                .expect("server closes idle connection")
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        // And service continues.
+        let query = build_query(22, "unlisted.test", TYPE_A);
+        assert_eq!(ask_tcp(&query).await, canned_reply(&query));
     }
 
     #[tokio::test]

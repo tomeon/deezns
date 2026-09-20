@@ -18,10 +18,19 @@
 //! tells glibc that the daemon does not serve the database, after which the
 //! client does its next hundred lookups in-process, unfiltered; a closed
 //! connection means the same.  A denial is therefore `found == 0` with
-//! `error == HOST_NOT_FOUND`, and an unreachable upstream becomes
-//! `found == 0` with `error == TRY_AGAIN`.  Non-host requests that cannot be
-//! forwarded are answered by closing the connection on purpose: glibc then
-//! serves that lookup from its built-in sources.
+//! `error == HOST_NOT_FOUND`, and an unreachable, silent or malformed
+//! upstream becomes `found == 0` with `error == TRY_AGAIN`: whatever the
+//! real nscd sends back for a host request is checked to be a complete,
+//! well-formed positive or negative reply before it is relayed.  Non-host
+//! requests that cannot be forwarded are answered by closing the
+//! connection on purpose: glibc then serves that lookup from its built-in
+//! sources.
+//!
+//! The socket is world-connectable, so the work is bounded: at most
+//! `max_connections` connections at once, a deadline for the client to send
+//! its request and for the upstream to answer, and `accept()` failures
+//! (file descriptor exhaustion, say) are logged and retried rather than
+//! taking the front-end down.
 
 use crate::peercred::peer_caller;
 use crate::policy::{Caller, NscdFrontendConfig, PolicyEngine, PolicyVerdict};
@@ -32,9 +41,11 @@ use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 /// The only protocol version glibc has ever spoken.
@@ -48,6 +59,19 @@ const HEADER_LEN: usize = 12;
 pub const HOST_NOT_FOUND: i32 = 1;
 pub const TRY_AGAIN: i32 = 2;
 pub const NO_DATA: i32 = 4;
+
+/// Sizes of `ai_response_header` and `hst_response_header`.
+const AI_HEADER_LEN: usize = 24;
+const HST_HEADER_LEN: usize = 32;
+
+/// Concurrent connections at most.
+const DEFAULT_MAX_CONNECTIONS: usize = 512;
+/// How long a client may take to send its request.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the real nscd may take to answer.
+const DEFAULT_UPSTREAM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Pause after a failed accept(), typically from descriptor exhaustion.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// `request_type` from `nscd/nscd-client.h`, in declaration order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,6 +319,73 @@ pub fn hst_found(name: &str, family: i32, addrs: &[IpAddr]) -> Option<Vec<u8>> {
     }
 }
 
+/// Whether `reply`, from the real nscd, is a complete positive or negative
+/// answer to a host request of type `ty`.  Anything else (nothing at all,
+/// a truncated body, `found == -1` for a database it does not serve) must
+/// not reach the client, which would take it as "no nscd here".
+pub fn valid_host_reply(ty: RequestType, reply: &[u8]) -> bool {
+    let int = |at: usize| {
+        reply
+            .get(at..at + 4)
+            .map(|b| i64::from(i32::from_ne_bytes(b.try_into().unwrap())))
+    };
+    let (Some(version), Some(found)) = (int(0), int(4)) else {
+        return false;
+    };
+    if version != i64::from(VERSION) {
+        return false;
+    }
+    let len = reply.len() as i64;
+    match ty {
+        RequestType::GetAi => {
+            if len < AI_HEADER_LEN as i64 {
+                return false;
+            }
+            match found {
+                0 => true,
+                1 => {
+                    let (Some(naddrs), Some(addrslen), Some(canonlen)) = (int(8), int(12), int(16))
+                    else {
+                        return false;
+                    };
+                    naddrs >= 0
+                        && addrslen >= 0
+                        && canonlen >= 0
+                        && len == AI_HEADER_LEN as i64 + naddrs + addrslen + canonlen
+                }
+                _ => false,
+            }
+        }
+        _ => {
+            if len < HST_HEADER_LEN as i64 {
+                return false;
+            }
+            match found {
+                0 => true,
+                1 => {
+                    let (Some(name_len), Some(aliases_cnt), Some(length), Some(addr_cnt)) =
+                        (int(8), int(12), int(20), int(24))
+                    else {
+                        return false;
+                    };
+                    // The alias strings follow the addresses with lengths
+                    // given inside the body, so only a lower bound is known.
+                    name_len >= 0
+                        && aliases_cnt >= 0
+                        && addr_cnt >= 0
+                        && (length == 4 || length == 16)
+                        && len
+                            >= HST_HEADER_LEN as i64
+                                + name_len
+                                + aliases_cnt * 4
+                                + addr_cnt * length
+                }
+                _ => false,
+            }
+        }
+    }
+}
+
 fn not_found(ty: RequestType, error: i32) -> Vec<u8> {
     match ty {
         RequestType::GetAi => ai_not_found(error),
@@ -326,14 +417,37 @@ pub enum Reply {
 pub struct Frontend {
     listen: PathBuf,
     upstream: PathBuf,
+    read_timeout: Duration,
+    upstream_timeout: Duration,
+    slots: Arc<Semaphore>,
     engine: Arc<PolicyEngine>,
 }
 
 impl Frontend {
     pub fn new(config: &NscdFrontendConfig, engine: Arc<PolicyEngine>) -> Self {
+        Self::with_limits(
+            config,
+            engine,
+            DEFAULT_READ_TIMEOUT,
+            DEFAULT_UPSTREAM_TIMEOUT,
+            DEFAULT_MAX_CONNECTIONS,
+        )
+    }
+
+    /// `new`, with the deadlines and the concurrency limit chosen.
+    pub fn with_limits(
+        config: &NscdFrontendConfig,
+        engine: Arc<PolicyEngine>,
+        read_timeout: Duration,
+        upstream_timeout: Duration,
+        max_connections: usize,
+    ) -> Self {
         Frontend {
             listen: config.listen.clone(),
             upstream: config.upstream.clone(),
+            read_timeout,
+            upstream_timeout,
+            slots: Arc::new(Semaphore::new(max_connections)),
             engine,
         }
     }
@@ -357,9 +471,21 @@ impl Frontend {
 
     pub async fn serve(self: Arc<Self>, listener: UnixListener) -> io::Result<()> {
         loop {
-            let (stream, _) = listener.accept().await?;
+            let slot = Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                .expect("semaphore open");
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    warn!(%e, "nscd accept failed; retrying");
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+            };
             let front = Arc::clone(&self);
             tokio::spawn(async move {
+                let _slot = slot;
                 if let Err(e) = front.handle(stream).await {
                     debug!(%e, "nscd connection ended with error");
                 }
@@ -369,10 +495,18 @@ impl Frontend {
 
     async fn handle(&self, mut stream: UnixStream) -> io::Result<()> {
         let caller = peer_caller(&stream)?;
-        let request = match read_request(&mut stream).await {
-            Ok(r) => r,
-            Err(e) => {
+        let request = match tokio::time::timeout(self.read_timeout, read_request(&mut stream)).await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
                 warn!(%e, peer.uid = caller.uid_value(), "bad nscd request");
+                return Ok(());
+            }
+            Err(_) => {
+                debug!(
+                    peer.uid = caller.uid_value(),
+                    "nscd client sent no request in time; closing"
+                );
                 return Ok(());
             }
         };
@@ -450,7 +584,15 @@ impl Frontend {
 
     async fn forward_host(&self, request: &Request) -> Reply {
         match self.forward(request).await {
-            Ok(bytes) => Reply::Bytes(bytes),
+            Ok(bytes) if valid_host_reply(request.ty, &bytes) => Reply::Bytes(bytes),
+            Ok(bytes) => {
+                error!(
+                    len = bytes.len(),
+                    request = ?request.ty,
+                    "upstream nscd sent no usable host reply, answering TRY_AGAIN"
+                );
+                Reply::Bytes(not_found(request.ty, TRY_AGAIN))
+            }
             Err(e) => {
                 error!(%e, "upstream nscd unreachable, answering TRY_AGAIN");
                 Reply::Bytes(not_found(request.ty, TRY_AGAIN))
@@ -458,13 +600,23 @@ impl Frontend {
         }
     }
 
-    /// Send the request verbatim to the real nscd and collect its reply.
+    /// Send the request verbatim to the real nscd and collect its reply,
+    /// within the upstream deadline.
     async fn forward(&self, request: &Request) -> io::Result<Vec<u8>> {
-        let mut upstream = UnixStream::connect(&self.upstream).await?;
-        upstream.write_all(&request.raw).await?;
-        let mut reply = Vec::new();
-        upstream.read_to_end(&mut reply).await?;
-        Ok(reply)
+        tokio::time::timeout(self.upstream_timeout, async {
+            let mut upstream = UnixStream::connect(&self.upstream).await?;
+            upstream.write_all(&request.raw).await?;
+            let mut reply = Vec::new();
+            upstream.read_to_end(&mut reply).await?;
+            Ok(reply)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "upstream nscd did not answer in time",
+            ))
+        })
     }
 }
 
@@ -594,6 +746,10 @@ mod tests {
 
     impl FakeUpstream {
         async fn start(reply: &'static [u8]) -> Self {
+            Self::start_with(reply.to_vec()).await
+        }
+
+        async fn start_with(reply: Vec<u8>) -> Self {
             let path = temp_socket("upstream");
             let listener = UnixListener::bind(&path).unwrap();
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -604,7 +760,7 @@ mod tests {
                     let mut buf = vec![0; 4096];
                     let n = stream.read(&mut buf).await.unwrap();
                     seen_by_server.lock().unwrap().push(buf[..n].to_vec());
-                    stream.write_all(reply).await.unwrap();
+                    stream.write_all(&reply).await.unwrap();
                     stream.shutdown().await.unwrap();
                 }
             });
@@ -616,15 +772,21 @@ mod tests {
         }
     }
 
+    const TEST_TIMEOUT: Duration = Duration::from_millis(300);
+    const TEST_MAX_CONNECTIONS: usize = 4;
+
     async fn start_frontend(policy: &str, upstream: &std::path::Path) -> Arc<Frontend> {
         let cfg: PolicyConfig = toml::from_str(policy).unwrap();
         let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
-        let front = Arc::new(Frontend::new(
+        let front = Arc::new(Frontend::with_limits(
             &NscdFrontendConfig {
                 listen: temp_socket("front"),
                 upstream: upstream.to_path_buf(),
             },
             engine,
+            TEST_TIMEOUT,
+            TEST_TIMEOUT,
+            TEST_MAX_CONNECTIONS,
         ));
         let listener = front.bind().unwrap();
         tokio::spawn(Arc::clone(&front).serve(listener));
@@ -643,7 +805,11 @@ mod tests {
         reply
     }
 
-    const CANNED: &[u8] = b"canned reply from upstream";
+    /// A well-formed positive GETAI reply, as the real nscd would send for
+    /// a name it resolved.
+    fn canned() -> Vec<u8> {
+        ai_found("canned.test", &[IpAddr::V4(Ipv4Addr::new(192, 0, 2, 99))])
+    }
 
     fn policy_for_this_user() -> String {
         format!(
@@ -678,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     async fn denials_are_answered_without_asking_upstream() {
-        let upstream = FakeUpstream::start(CANNED).await;
+        let upstream = FakeUpstream::start_with(canned()).await;
         let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
 
         let reply = ask(
@@ -700,30 +866,30 @@ mod tests {
 
     #[tokio::test]
     async fn passthrough_and_other_requests_are_forwarded_verbatim() {
-        let upstream = FakeUpstream::start(CANNED).await;
+        let upstream = FakeUpstream::start_with(canned()).await;
         let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
 
         let getai = Request::encode(RequestType::GetAi, b"unlisted.test\0");
-        assert_eq!(ask(&front, getai.clone()).await, CANNED);
+        assert_eq!(ask(&front, getai.clone()).await, canned());
 
         let getpw = Request::encode(RequestType::GetPwByName, b"alice\0");
-        assert_eq!(ask(&front, getpw.clone()).await, CANNED);
+        assert_eq!(ask(&front, getpw.clone()).await, canned());
 
         let byaddr = Request::encode(RequestType::GetHostByAddr, &[127, 0, 0, 1]);
-        assert_eq!(ask(&front, byaddr.clone()).await, CANNED);
+        assert_eq!(ask(&front, byaddr.clone()).await, canned());
 
         assert_eq!(upstream.seen(), vec![getai, getpw, byaddr]);
     }
 
     #[tokio::test]
     async fn the_callers_own_credentials_reach_the_policy() {
-        let upstream = FakeUpstream::start(CANNED).await;
+        let upstream = FakeUpstream::start_with(canned()).await;
         let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
 
         // We are the caller, so the uid/gid/pid rule matches and the name
         // is allowed (and, having no local records, forwarded).
         let reply = ask(&front, Request::encode(RequestType::GetAi, b"mine.test\0")).await;
-        assert_eq!(reply, CANNED);
+        assert_eq!(reply, canned());
 
         // Directly: another caller gets the deny rule.
         let request = Request::parse(&Request::encode(RequestType::GetAi, b"mine.test\0")).unwrap();
@@ -736,7 +902,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_daemons_own_records_are_answered_directly() {
-        let upstream = FakeUpstream::start(CANNED).await;
+        let upstream = FakeUpstream::start_with(canned()).await;
         let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
         let ten = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
@@ -803,9 +969,144 @@ mod tests {
         assert!(reply.is_empty());
     }
 
+    #[test]
+    fn host_replies_are_validated_before_relaying() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(valid_host_reply(
+            RequestType::GetAi,
+            &ai_found("a.test", &[v4])
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetAi,
+            &ai_not_found(HOST_NOT_FOUND)
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetHostByName,
+            &hst_found("a.test", libc::AF_INET, &[v4]).unwrap()
+        ));
+        assert!(valid_host_reply(
+            RequestType::GetHostByNameV6,
+            &hst_not_found(NO_DATA)
+        ));
+
+        // Nothing, too little, a truncated body, or "not served".
+        assert!(!valid_host_reply(RequestType::GetAi, &[]));
+        assert!(!valid_host_reply(
+            RequestType::GetAi,
+            &ai_not_found(0)[..23]
+        ));
+        let mut truncated = ai_found("a.test", &[v4]);
+        truncated.pop();
+        assert!(!valid_host_reply(RequestType::GetAi, &truncated));
+        assert!(!valid_host_reply(
+            RequestType::GetAi,
+            &ai_reply(-1, 0, "", &[])
+        ));
+        assert!(!valid_host_reply(
+            RequestType::GetHostByName,
+            &hst_reply(-1, 0, "", -1, &[])
+        ));
+        let mut short = hst_found("a.test", libc::AF_INET, &[v4]).unwrap();
+        short.truncate(HST_HEADER_LEN + 3);
+        assert!(!valid_host_reply(RequestType::GetHostByName, &short));
+        let mut wrong_version = ai_not_found(0);
+        wrong_version[..4].copy_from_slice(&1i32.to_ne_bytes());
+        assert!(!valid_host_reply(RequestType::GetAi, &wrong_version));
+    }
+
+    #[tokio::test]
+    async fn a_silent_or_broken_upstream_never_reaches_the_client_as_is() {
+        // An upstream that closes without a word, as nsncd does for a
+        // database it is told to ignore.
+        let silent = FakeUpstream::start(b"").await;
+        let front = start_frontend(&policy_for_this_user(), &silent.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(TRY_AGAIN));
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetHostByName, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, hst_not_found(TRY_AGAIN));
+        // Non-host requests are relayed as they are: glibc then serves them
+        // from its built-in sources.
+        assert!(ask(
+            &front,
+            Request::encode(RequestType::GetPwByName, b"alice\0")
+        )
+        .await
+        .is_empty());
+
+        // "Database not served" is turned into a temporary failure too.
+        let not_served = FakeUpstream::start_with(ai_reply(-1, 0, "", &[])).await;
+        let front = start_frontend(&policy_for_this_user(), &not_served.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(TRY_AGAIN));
+
+        // A well-formed reply passes through unchanged.
+        let ten = IpAddr::V4(Ipv4Addr::new(10, 9, 8, 7));
+        let good = FakeUpstream::start_with(ai_found("unlisted.test", &[ten])).await;
+        let front = start_frontend(&policy_for_this_user(), &good.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_found("unlisted.test", &[ten]));
+    }
+
+    #[tokio::test]
+    async fn idle_clients_are_dropped_and_do_not_block_others() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+
+        // Fill every slot with clients that send nothing.
+        let mut idle = Vec::new();
+        for _ in 0..TEST_MAX_CONNECTIONS {
+            idle.push(UnixStream::connect(front.listen_path()).await.unwrap());
+        }
+        // After the deadline the server closes them: a read sees EOF.
+        for mut stream in idle {
+            let mut buf = [0u8; 1];
+            let n = tokio::time::timeout(TEST_TIMEOUT * 4, stream.read(&mut buf))
+                .await
+                .expect("server closes idle connection")
+                .unwrap();
+            assert_eq!(n, 0);
+        }
+        // And service continues.
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"unlisted.test\0"),
+        )
+        .await;
+        assert_eq!(reply, canned());
+    }
+
+    #[tokio::test]
+    async fn absolute_names_are_judged_like_relative_ones() {
+        let upstream = FakeUpstream::start_with(canned()).await;
+        let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
+        let reply = ask(
+            &front,
+            Request::encode(RequestType::GetAi, b"blocked.test.\0"),
+        )
+        .await;
+        assert_eq!(reply, ai_not_found(HOST_NOT_FOUND));
+        assert!(upstream.seen().is_empty());
+    }
+
     #[tokio::test]
     async fn malformed_requests_are_dropped() {
-        let upstream = FakeUpstream::start(CANNED).await;
+        let upstream = FakeUpstream::start_with(canned()).await;
         let front = start_frontend(&policy_for_this_user(), &upstream.path).await;
 
         let mut bad_version = Request::encode(RequestType::GetAi, b"unlisted.test\0");
