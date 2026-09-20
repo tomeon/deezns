@@ -159,6 +159,36 @@ curl -o /etc/deezns/lists/stevenblack-hosts.txt \
 RUST_LOG=info deezns-daemon
 ```
 
+## Running behind nscd
+
+On systems where glibc routes lookups through nscd, which includes every
+NixOS system (it runs [nsncd](https://github.com/twosigma/nsncd) and
+loads third-party NSS modules only there), an NSS module never sees the
+process that asked: the module runs inside nscd, so `SO_PEERCRED` on the
+daemon's socket reports nscd's uid, gid and pid for every lookup.
+
+The daemon can instead take nscd's place on the wire. With an
+`[nscd_frontend]` section in the policy it listens on the socket glibc's
+client uses, applies the policy to host requests (`GETAI`,
+`GETHOSTBYNAME`, `GETHOSTBYNAMEv6`) with the credentials of the process
+that connected, and forwards everything else, passwd and group lookups
+included, byte for byte to the real nscd on another socket:
+
+```toml
+[nscd_frontend]
+listen = "/run/nscd/socket"      # where glibc looks (_PATH_NSCDSOCKET)
+upstream = "/run/nsncd/socket"   # nsncd, started with NSNCD_SOCKET_PATH
+```
+
+In this mode the NSS module and the `deezns` line in `nsswitch.conf`
+are not needed; an allowed name is resolved by nscd through the normal
+`files` and `dns` sources. Denials are answered as "host not found"
+(never as "database not served", which would make glibc bypass nscd
+for its next hundred lookups), an unreachable nscd yields a temporary
+failure for host lookups, and other requests fall back to glibc's
+built-in sources. Reverse lookups carry an address rather than a name
+and are forwarded unfiltered.
+
 ## Compile-time options
 
 | Environment variable | Default                    | Purpose          |

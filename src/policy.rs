@@ -101,6 +101,19 @@ pub struct BlocklistConfig {
     pub path: PathBuf,
 }
 
+/// The nscd-protocol front-end (see `nscd.rs`): deezns answers on the socket
+/// glibc's nscd client uses, applies the policy to host lookups with the
+/// real caller's credentials, and forwards everything else to the actual
+/// nscd listening at `upstream`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NscdFrontendConfig {
+    /// Where to listen; glibc looks at `/var/run/nscd/socket`.
+    pub listen: PathBuf,
+    /// The real nscd (nsncd's `NSNCD_SOCKET_PATH`) that serves everything
+    /// deezns does not answer itself.
+    pub upstream: PathBuf,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_passthrough")]
@@ -111,6 +124,49 @@ pub struct PolicyConfig {
 
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+
+    #[serde(default)]
+    pub nscd_frontend: Option<NscdFrontendConfig>,
+}
+
+impl PolicyConfig {
+    /// Read and parse the configuration file.
+    pub fn from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let text = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&text)?)
+    }
+}
+
+/// Who is asking, as far as the daemon can tell.
+///
+/// `uid` is always known.  Front-ends that learn about the caller
+/// indirectly may not be able to determine the group or process; those are
+/// exposed to CEL as `-1`, which no real gid or pid equals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caller {
+    pub uid: u32,
+    pub gid: Option<u32>,
+    pub pid: Option<i32>,
+}
+
+impl Caller {
+    pub fn new(uid: u32, gid: u32, pid: i32) -> Self {
+        Caller {
+            uid,
+            gid: Some(gid),
+            pid: Some(pid),
+        }
+    }
+
+    /// The value a CEL rule sees for `gid`.
+    pub fn gid_value(&self) -> i64 {
+        self.gid.map_or(-1, i64::from)
+    }
+
+    /// The value a CEL rule sees for `pid`.
+    pub fn pid_value(&self) -> i64 {
+        self.pid.map_or(-1, i64::from)
+    }
 }
 
 fn default_passthrough() -> DefaultVerdict {
@@ -145,11 +201,9 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Load config, parse all blocklists, compile all CEL expressions.
-    pub fn load(config_path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let text = std::fs::read_to_string(config_path)?;
-        let cfg: PolicyConfig = toml::from_str(&text)?;
-
+    /// Parse all blocklists and compile all CEL expressions of a parsed
+    /// configuration (see [`PolicyConfig::from_path`] for the file).
+    pub fn from_config(cfg: &PolicyConfig) -> Result<Self, Box<dyn std::error::Error>> {
         // Load blocklists.
         let mut blocklists = HashMap::new();
         for bl_cfg in &cfg.blocklists {
@@ -184,12 +238,18 @@ impl PolicyEngine {
         Ok(Self {
             rules,
             blocklists,
-            default_verdict: cfg.default_verdict,
+            default_verdict: cfg.default_verdict.clone(),
         })
     }
 
-    /// Evaluate the policy for a given query.
+    /// Evaluate the policy for a query from a fully identified caller.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn evaluate(&self, hostname: &str, uid: u32, gid: u32, pid: i32) -> PolicyVerdict {
+        self.evaluate_for(hostname, &Caller::new(uid, gid, pid))
+    }
+
+    /// Evaluate the policy for a given query.
+    pub fn evaluate_for(&self, hostname: &str, caller: &Caller) -> PolicyVerdict {
         let hostname_lower = hostname.to_ascii_lowercase();
 
         // Pre-compute blocklist membership so we can expose it as a
@@ -212,9 +272,9 @@ impl PolicyEngine {
             // Variables.
             ctx.add_variable("hostname", hostname_lower.clone())
                 .unwrap();
-            ctx.add_variable("uid", uid as i64).unwrap();
-            ctx.add_variable("gid", gid as i64).unwrap();
-            ctx.add_variable("pid", pid as i64).unwrap();
+            ctx.add_variable("uid", i64::from(caller.uid)).unwrap();
+            ctx.add_variable("gid", caller.gid_value()).unwrap();
+            ctx.add_variable("pid", caller.pid_value()).unwrap();
 
             // blocked_by("list_name") → bool
             //
@@ -352,6 +412,61 @@ mod tests {
             engine.evaluate("example.com", 1000, 1000, 1),
             PolicyVerdict::PassThrough,
         );
+    }
+
+    #[test]
+    fn unknown_gid_and_pid_are_minus_one() {
+        let engine = engine_from_toml(
+            r#"
+            default_verdict = "deny"
+
+            [[rules]]
+            note = "gid known"
+            expr = "gid == 100"
+            verdict = "allow"
+
+            [[rules]]
+            note = "gid unknown"
+            expr = "gid == -1 && pid == -1"
+            verdict = "passthrough"
+        "#,
+        );
+
+        let known = Caller::new(1000, 100, 7);
+        assert_eq!(
+            engine.evaluate_for("a.test", &known),
+            PolicyVerdict::Allowed
+        );
+
+        let unknown = Caller {
+            uid: 1000,
+            gid: None,
+            pid: None,
+        };
+        assert_eq!(
+            engine.evaluate_for("a.test", &unknown),
+            PolicyVerdict::PassThrough
+        );
+        assert_eq!(unknown.gid_value(), -1);
+        assert_eq!(unknown.pid_value(), -1);
+    }
+
+    #[test]
+    fn nscd_frontend_section_is_optional() {
+        let cfg: PolicyConfig = toml::from_str(r#"default_verdict = "deny""#).unwrap();
+        assert!(cfg.nscd_frontend.is_none());
+
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+            [nscd_frontend]
+            listen = "/run/nscd/socket"
+            upstream = "/run/nsncd/socket"
+        "#,
+        )
+        .unwrap();
+        let front = cfg.nscd_frontend.unwrap();
+        assert_eq!(front.listen, PathBuf::from("/run/nscd/socket"));
+        assert_eq!(front.upstream, PathBuf::from("/run/nsncd/socket"));
     }
 
     #[test]
