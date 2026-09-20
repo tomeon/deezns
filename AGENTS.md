@@ -59,6 +59,20 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     `NSNCD_SOCKET_PATH`. A denial must be answered as `found=0` with
     `HOST_NOT_FOUND`: `found=-1` or a closed connection makes glibc
     bypass nscd for its next hundred lookups.
+  - `dns`: the daemon serves DNS on `services.deezns.dns.listen`
+    (`src/dns.rs`, UDP and TCP, forwarding to `dns.upstream`), is put
+    first in `networking.nameservers`, and nscd.service gets
+    `NSNCD_IGNORE_HOSTS=true` so glibc resolves in-process and the query
+    leaves the caller's own socket. `src/identify.rs` reads the caller's
+    uid from `/proc/net/{udp,udp6,tcp,tcp6}`; with
+    `dns.identifyProcesses` (off by default) the unit gets
+    `CAP_DAC_READ_SEARCH` (to list another user's 0500 `/proc/<pid>/fd`)
+    and `CAP_SYS_PTRACE` (to follow its links) and the pid and gid are
+    found via `/proc/<pid>/fd` and status, otherwise rules see
+    `gid == -1` and `pid == -1`. The
+    unit also gets `CAP_NET_BIND_SERVICE`, `AF_INET`/`AF_INET6` and
+    `ProcSubset=all` (for `/proc/net`). This mode also covers programs
+    with their own DNS client.
   - `nss`: the package goes into `system.nssModules` and
     `deezns [!UNAVAIL=return]` into the `hosts` line at `nssOrder`.
     NixOS loads third-party NSS modules only inside nsncd, so the

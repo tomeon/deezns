@@ -39,6 +39,7 @@
     "skip.passthrough.test" = "192.0.2.50";
     "alice-only.test" = "192.0.2.60";
     "staff-only.test" = "192.0.2.61";
+    "known-process.test" = "192.0.2.62";
   };
 
   aliceUid = 1000;
@@ -155,7 +156,7 @@ in {
             }
             {
               note = "alice only";
-              expr = ''uid == ${toString aliceUid} && pid > 0 && hostname == "alice-only.test"'';
+              expr = ''uid == ${toString aliceUid} && hostname == "alice-only.test"'';
               verdict = "allow";
             }
             {
@@ -174,6 +175,17 @@ in {
               verdict = "deny";
             }
             {
+              # Only callers whose process could be identified.
+              note = "known process";
+              expr = ''pid > 0 && hostname == "known-process.test"'';
+              verdict = "allow";
+            }
+            {
+              note = "everyone else: known-process.test";
+              expr = ''hostname == "known-process.test"'';
+              verdict = "deny";
+            }
+            {
               # The daemon has a built-in record for this name, so an
               # allow verdict resolves it without asking upstream.
               note = "daemon-resolved";
@@ -186,9 +198,21 @@ in {
 
       # Switched to mid-test: the same policy with the other default
       # verdict, and the NSS-module front-end.
-      specialisation = {
+      specialisation = let
+        dns = identifyProcesses: {
+          services.deezns = {
+            frontend = "dns";
+            dns = {
+              inherit identifyProcesses;
+              upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
+            };
+          };
+        };
+      in {
         default-deny.configuration.services.deezns.settings.default_verdict = lib.mkForce "deny";
         nss-module.configuration.services.deezns.frontend = "nss";
+        dns.configuration = dns false;
+        dns-ptrace.configuration = dns true;
       };
 
       # A user that only nss-systemd knows, so `getent passwd dynuser`
@@ -369,6 +393,8 @@ in {
         assert nss_as("carol", "staff-only.test") == [records["staff-only.test"]]
         assert nss_as("alice", "staff-only.test") is None
         assert nss_as("bob", "allowed.test") == [records["allowed.test"]]
+        # SO_PEERCRED also carries the pid.
+        assert nss("known-process.test") == [records["known-process.test"]]
         client.succeed(
             "journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid=${toString aliceUid} '"
         )
@@ -381,6 +407,7 @@ in {
         assert query("carol", "alice-only.test")["verdict"] == "Denied"
         assert query("carol", "staff-only.test") == {"verdict": "PassThrough"}
         assert query("alice", "staff-only.test")["verdict"] == "Denied"
+        assert query("alice", "known-process.test") == {"verdict": "PassThrough"}
         assert query("alice", "example.local") == {
             "verdict": "Resolved",
             "addresses": ["10.0.0.1"],
@@ -452,5 +479,64 @@ in {
         client.succeed(
             f"journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid} '"
         )
+
+    def daemon_log():
+        """journalctl restricted to the daemon's current instance."""
+        invocation = client.succeed("systemctl show -p InvocationID --value deezns").strip()
+        return f"journalctl _SYSTEMD_INVOCATION_ID={invocation}"
+
+
+    def local_dns(name, *args):
+        """Ask the daemon's DNS front-end directly, bypassing glibc."""
+        return client.succeed(f"dig +time=2 +tries=1 {' '.join(args)} @127.0.0.1 {name} A")
+
+
+    with subtest("The DNS front-end judges queries from any resolver"):
+        client.succeed(f"{base_system}/specialisation/dns/bin/switch-to-configuration test")
+        client.wait_for_unit("deezns.service")
+        client.wait_for_unit("nscd.service")
+        client.wait_until_succeeds("dig +time=1 +tries=1 @127.0.0.1 allowed.test")
+        client.succeed("journalctl -u deezns | grep 'listening (DNS front-end)'")
+        client.succeed("grep -m1 '^nameserver' /etc/resolv.conf | grep -w 127.0.0.1")
+        client.succeed("systemctl show nscd -p Environment | grep NSNCD_IGNORE_HOSTS=true")
+        client.fail("grep -E '^hosts:.*deezns' /etc/nsswitch.conf")
+        # Directly, as a program with its own resolver would.
+        assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test")
+        assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test", "+tcp")
+        assert local_dns("allowed.test", "+short").split() == [records["allowed.test"]]
+        assert local_dns("example.local", "+short").split() == ["10.0.0.1"]
+        # And through glibc, which now resolves in-process via resolv.conf.
+        expect_blocked("ads.hosts-format.test")
+        expect_blocked("42.metrics.test")
+        expect_resolved("allowed.test")
+        expect_resolved("unlisted.test")
+        assert nss("example.local") == ["10.0.0.1"]
+        client.succeed("getent passwd dynuser")
+
+    with subtest("Without identifyProcesses the DNS front-end knows the caller's uid only"):
+        client.succeed(f"{daemon_log()} | grep 'identified by uid only'")
+        assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
+        assert nss_as("carol", "alice-only.test") is None
+        # carol's gid and the caller's pid cannot be determined, so rules
+        # on them cannot match.
+        assert nss_as("carol", "staff-only.test") is None
+        assert nss("known-process.test") is None
+        client.succeed(
+            f"{daemon_log()} | grep 'hostname=\"staff-only.test\"' | grep 'peer.uid=1001 ' | grep 'peer.gid=-1 peer.pid=-1 '"
+        )
+
+    with subtest("With identifyProcesses it knows the caller's gid and pid too"):
+        client.succeed(f"{base_system}/specialisation/dns-ptrace/bin/switch-to-configuration test")
+        client.wait_for_unit("deezns.service")
+        client.wait_until_succeeds("dig +time=1 +tries=1 @127.0.0.1 allowed.test")
+        client.fail(f"{daemon_log()} | grep 'identified by uid only'")
+        assert nss_as("carol", "staff-only.test") == [records["staff-only.test"]]
+        assert nss_as("alice", "staff-only.test") is None
+        assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
+        assert nss("known-process.test") == [records["known-process.test"]]
+        client.succeed(
+            f"{daemon_log()} | grep 'hostname=\"staff-only.test\"' | grep 'peer.uid=1001 peer.gid=${toString staffGid} ' | grep -v 'peer.pid=-1'"
+        )
+        expect_blocked("ads.hosts-format.test")
   '';
 }
