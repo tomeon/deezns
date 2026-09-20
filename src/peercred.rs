@@ -38,7 +38,7 @@ mod tests {
     fn peer_of_a_socket_pair_is_this_process() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         let caller = peer_caller(&ours).unwrap();
-        assert_eq!(caller.uid, unsafe { libc::geteuid() });
+        assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
         assert_eq!(caller.gid, Some(unsafe { libc::getegid() }));
         assert_eq!(caller.pid, Some(std::process::id() as i32));
     }

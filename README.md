@@ -189,6 +189,37 @@ failure for host lookups, and other requests fall back to glibc's
 built-in sources. Reverse lookups carry an address rather than a name
 and are forwarded unfiltered.
 
+## Running as the local DNS server
+
+The third front-end sidesteps NSS altogether. With a `[dns_frontend]`
+section the daemon serves DNS on a loopback address, over UDP and TCP;
+point `/etc/resolv.conf` at it and every resolver on the machine goes
+through the policy, glibc's `dns` source and programs with their own DNS
+client (browsers, Go binaries) alike:
+
+```toml
+[dns_frontend]
+listen = "127.0.0.1:53"
+upstream = "192.0.2.53:53"   # the real resolver
+upstream_timeout_ms = 5000   # optional
+```
+
+A DNS query carries no credentials, so the caller is read off the socket
+it came from: `/proc/net/udp`, `/proc/net/udp6`, `/proc/net/tcp` and
+`/proc/net/tcp6` list every local socket with its owner's uid and its
+inode, readable by anyone. Turning the inode into a process, and so into
+a `gid` and `pid`, means finding it under `/proc/<pid>/fd`, which for
+other users' processes needs `CAP_SYS_PTRACE`; without that capability
+the daemon says so once at startup and rules see `gid == -1` and
+`pid == -1`. `uid` is `-1` only when no local socket matches the query,
+which does not happen for queries from this machine.
+
+Denied names get NXDOMAIN, the daemon's own records are answered
+directly, and everything else is forwarded verbatim to the upstream
+server over the transport the client used; an upstream that does not
+answer within the timeout yields SERVFAIL. Only the question section is
+interpreted, so every record type and EDNS pass through untouched.
+
 ## Compile-time options
 
 | Environment variable | Default                    | Purpose          |

@@ -1,6 +1,8 @@
 //! deezns-daemon — async DNS resolver daemon with CEL-based policy.
 
 mod blocklist;
+mod dns;
+mod identify;
 mod nscd;
 mod peercred;
 mod policy;
@@ -47,7 +49,7 @@ async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io:
             PolicyVerdict::Denied(reason) => {
                 info!(
                     hostname = req.hostname,
-                    peer.uid = caller.uid,
+                    peer.uid = caller.uid_value(),
                     peer.pid = caller.pid_value(),
                     %reason,
                     "DENIED"
@@ -58,7 +60,7 @@ async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io:
             PolicyVerdict::PassThrough => {
                 info!(
                     hostname = req.hostname,
-                    peer.uid = caller.uid,
+                    peer.uid = caller.uid_value(),
                     peer.pid = caller.pid_value(),
                     "PASSTHROUGH"
                 );
@@ -70,7 +72,7 @@ async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io:
                 if addrs.is_empty() {
                     info!(
                         hostname = req.hostname,
-                        peer.uid = caller.uid,
+                        peer.uid = caller.uid_value(),
                         peer.pid = caller.pid_value(),
                         "ALLOWED (no local records, passing through)"
                     );
@@ -78,7 +80,7 @@ async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io:
                 } else {
                     info!(
                         hostname = req.hostname,
-                        peer.uid = caller.uid,
+                        peer.uid = caller.uid_value(),
                         peer.pid = caller.pid_value(),
                         count = addrs.len(),
                         "RESOLVED"
@@ -165,10 +167,27 @@ async fn main() -> io::Result<()> {
         None => None,
     };
 
+    let dns_front = match &config.dns_frontend {
+        Some(front_cfg) => {
+            let front = Arc::new(dns::Frontend::new(front_cfg, Arc::clone(&engine)));
+            let (udp, tcp) = front.bind().await?;
+            info!(
+                address = %front.listen_addr(),
+                upstream = %front_cfg.upstream,
+                "listening (DNS front-end)"
+            );
+            Some((front, udp, tcp))
+        }
+        None => None,
+    };
+
     let mut tasks = JoinSet::new();
     tasks.spawn(serve_policy_socket(policy_listener, engine));
     if let Some((front, listener)) = nscd_front {
         tasks.spawn(front.serve(listener));
+    }
+    if let Some((front, udp, tcp)) = dns_front {
+        tasks.spawn(front.serve(udp, tcp));
     }
 
     // The listeners run forever; the first one to stop takes the daemon

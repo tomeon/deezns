@@ -19,6 +19,16 @@ default_verdict = "deny"
 # listen = "/run/nscd/socket"
 # upstream = "/run/nsncd/socket"
 
+# ── DNS front-end (optional) ──────────────────────────────────────────
+# Serve DNS on loopback and point resolv.conf here; callers are
+# identified from their sockets (uid always; gid and pid only with
+# CAP_SYS_PTRACE, otherwise -1).  See "Running as the local DNS server"
+# in README.md.
+#
+# [dns_frontend]
+# listen = "127.0.0.1:53"
+# upstream = "192.0.2.53:53"
+
 # ── External blocklists ───────────────────────────────────────────────
 # Loaded at startup.  Supports hosts-file, domains-only, and AdBlock
 # (||domain^) formats.  Referenced in CEL via blocked_by("name").

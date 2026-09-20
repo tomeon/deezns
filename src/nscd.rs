@@ -372,7 +372,7 @@ impl Frontend {
         let request = match read_request(&mut stream).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(%e, peer.uid = caller.uid, "bad nscd request");
+                warn!(%e, peer.uid = caller.uid_value(), "bad nscd request");
                 return Ok(());
             }
         };
@@ -404,7 +404,7 @@ impl Frontend {
             PolicyVerdict::Denied(reason) => {
                 info!(
                     hostname,
-                    peer.uid = caller.uid,
+                    peer.uid = caller.uid_value(),
                     peer.gid = caller.gid_value(),
                     peer.pid = caller.pid_value(),
                     %reason,
@@ -415,7 +415,7 @@ impl Frontend {
             PolicyVerdict::PassThrough => {
                 info!(
                     hostname,
-                    peer.uid = caller.uid,
+                    peer.uid = caller.uid_value(),
                     peer.gid = caller.gid_value(),
                     peer.pid = caller.pid_value(),
                     "PASSTHROUGH"
@@ -427,7 +427,7 @@ impl Frontend {
                 if addrs.is_empty() {
                     info!(
                         hostname,
-                        peer.uid = caller.uid,
+                        peer.uid = caller.uid_value(),
                         peer.gid = caller.gid_value(),
                         peer.pid = caller.pid_value(),
                         "ALLOWED (no local records, forwarding to nscd)"
@@ -436,7 +436,7 @@ impl Frontend {
                 } else {
                     info!(
                         hostname,
-                        peer.uid = caller.uid,
+                        peer.uid = caller.uid_value(),
                         peer.gid = caller.gid_value(),
                         peer.pid = caller.pid_value(),
                         count = addrs.len(),

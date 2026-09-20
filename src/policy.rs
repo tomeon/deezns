@@ -57,6 +57,7 @@ use crate::blocklist::Blocklist;
 use cel_interpreter::{Context, Program, Value};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -114,6 +115,24 @@ pub struct NscdFrontendConfig {
     pub upstream: PathBuf,
 }
 
+/// The DNS front-end (see `dns.rs`): deezns answers DNS on a loopback
+/// address, identifies callers from their sockets, and forwards what it does
+/// not answer itself to `upstream`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsFrontendConfig {
+    /// Address and port to serve DNS on, over UDP and TCP.
+    pub listen: SocketAddr,
+    /// The real DNS server for names the policy lets through.
+    pub upstream: SocketAddr,
+    /// How long to wait for the upstream before answering SERVFAIL.
+    #[serde(default = "default_upstream_timeout_ms")]
+    pub upstream_timeout_ms: u64,
+}
+
+fn default_upstream_timeout_ms() -> u64 {
+    5000
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PolicyConfig {
     #[serde(default = "default_passthrough")]
@@ -127,6 +146,9 @@ pub struct PolicyConfig {
 
     #[serde(default)]
     pub nscd_frontend: Option<NscdFrontendConfig>,
+
+    #[serde(default)]
+    pub dns_frontend: Option<DnsFrontendConfig>,
 }
 
 impl PolicyConfig {
@@ -139,12 +161,12 @@ impl PolicyConfig {
 
 /// Who is asking, as far as the daemon can tell.
 ///
-/// `uid` is always known.  Front-ends that learn about the caller
-/// indirectly may not be able to determine the group or process; those are
-/// exposed to CEL as `-1`, which no real gid or pid equals.
+/// `SO_PEERCRED` gives all three.  Front-ends that learn about the caller
+/// indirectly may know only the uid, or nothing at all; whatever is unknown
+/// is exposed to CEL as `-1`, which no real uid, gid or pid equals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caller {
-    pub uid: u32,
+    pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub pid: Option<i32>,
 }
@@ -152,10 +174,24 @@ pub struct Caller {
 impl Caller {
     pub fn new(uid: u32, gid: u32, pid: i32) -> Self {
         Caller {
-            uid,
+            uid: Some(uid),
             gid: Some(gid),
             pid: Some(pid),
         }
+    }
+
+    /// A caller nothing is known about.
+    pub fn unknown() -> Self {
+        Caller {
+            uid: None,
+            gid: None,
+            pid: None,
+        }
+    }
+
+    /// The value a CEL rule sees for `uid`.
+    pub fn uid_value(&self) -> i64 {
+        self.uid.map_or(-1, i64::from)
     }
 
     /// The value a CEL rule sees for `gid`.
@@ -272,7 +308,7 @@ impl PolicyEngine {
             // Variables.
             ctx.add_variable("hostname", hostname_lower.clone())
                 .unwrap();
-            ctx.add_variable("uid", i64::from(caller.uid)).unwrap();
+            ctx.add_variable("uid", caller.uid_value()).unwrap();
             ctx.add_variable("gid", caller.gid_value()).unwrap();
             ctx.add_variable("pid", caller.pid_value()).unwrap();
 
@@ -439,7 +475,7 @@ mod tests {
         );
 
         let unknown = Caller {
-            uid: 1000,
+            uid: Some(1000),
             gid: None,
             pid: None,
         };
@@ -447,8 +483,38 @@ mod tests {
             engine.evaluate_for("a.test", &unknown),
             PolicyVerdict::PassThrough
         );
+        assert_eq!(unknown.uid_value(), 1000);
         assert_eq!(unknown.gid_value(), -1);
         assert_eq!(unknown.pid_value(), -1);
+
+        let nobody = Caller::unknown();
+        assert_eq!(nobody.uid_value(), -1);
+        assert_eq!(
+            engine.evaluate_for("a.test", &nobody),
+            PolicyVerdict::PassThrough
+        );
+    }
+
+    #[test]
+    fn dns_frontend_section_is_optional_with_a_default_timeout() {
+        let cfg: PolicyConfig = toml::from_str(r#"default_verdict = "deny""#).unwrap();
+        assert!(cfg.dns_frontend.is_none());
+
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+            [dns_frontend]
+            listen = "127.0.0.1:53"
+            upstream = "192.0.2.53:53"
+        "#,
+        )
+        .unwrap();
+        let front = cfg.dns_frontend.unwrap();
+        assert_eq!(front.listen, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
+        assert_eq!(
+            front.upstream,
+            "192.0.2.53:53".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(front.upstream_timeout_ms, 5000);
     }
 
     #[test]
