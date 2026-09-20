@@ -186,6 +186,12 @@ in {
               verdict = "deny";
             }
             {
+              # The DNS root reaches the rules as ".".
+              note = "root";
+              expr = ''hostname == "."'';
+              verdict = "deny";
+            }
+            {
               # The daemon has a built-in record for this name, so an
               # allow verdict resolves it without asking upstream.
               note = "daemon-resolved";
@@ -247,6 +253,49 @@ in {
 
       environment.systemPackages = [
         pkgs.dig
+        # A dual-stack DNS client: an IPv6 socket talking to the IPv4-mapped
+        # address of the daemon's IPv4 listener, over UDP or TCP.  dig cannot
+        # do this (its IPv6 sockets are IPV6_V6ONLY), but plenty of programs
+        # with their own resolvers do.
+        (pkgs.writers.writePython3Bin "dns-query-mapped" {} ''
+          import socket
+          import struct
+          import sys
+
+          name, transport = sys.argv[1], sys.argv[2]
+          question = b"".join(
+              bytes([len(label)]) + label.encode() for label in name.split(".") if label
+          ) + b"\0\0\x01\0\x01"
+          query = struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + question
+          target = ("::ffff:127.0.0.1", 53)
+          if transport == "tcp":
+              sock = socket.create_connection(target)
+              sock.sendall(struct.pack("!H", len(query)) + query)
+              (length,) = struct.unpack("!H", sock.recv(2))
+              reply = sock.recv(length)
+          else:
+              sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+              sock.settimeout(5)
+              sock.sendto(query, target)
+              reply, _ = sock.recvfrom(4096)
+          _, flags, _, ancount, _, _ = struct.unpack("!HHHHHH", reply[:12])
+          addresses = []
+          at = 12 + len(question)
+          for _ in range(ancount):
+              # The owner name: a compression pointer, or labels.
+              if reply[at] & 0xC0 == 0xC0:
+                  at += 2
+              else:
+                  while reply[at]:
+                      at += 1 + reply[at]
+                  at += 1
+              rtype, _, _, rdlength = struct.unpack("!HHIH", reply[at:at + 10])
+              rdata = reply[at + 10:at + 10 + rdlength]
+              if rtype == 1:
+                  addresses.append(".".join(str(b) for b in rdata))
+              at += 10 + rdlength
+          print(f"rcode={flags & 0xF} addresses={','.join(addresses)}")
+        '')
         # Talks to the daemon over its socket, bypassing glibc, so the
         # daemon sees the caller's own credentials.
         (pkgs.writers.writePython3Bin "deezns-query" {} ''
@@ -362,9 +411,12 @@ in {
         # AdBlock entries match whole labels, not string suffixes.
         expect_resolved("notadblock-format.test")
 
-    with subtest("Hostnames are matched case-insensitively"):
+    with subtest("Hostnames are matched case-insensitively, with or without a trailing dot"):
         assert nss("ADS.Hosts-Format.TEST") is None
         assert nss("Allowed.TEST") == [records["allowed.test"]]
+        expect_blocked("ads.hosts-format.test.")
+        expect_blocked("evil.suffix.test.")
+        expect_resolved("allowed.test.")
 
     with subtest("CEL string methods and regexes"):
         expect_blocked("evil.suffix.test")
@@ -503,8 +555,11 @@ in {
         # Directly, as a program with its own resolver would.
         assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test")
         assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test", "+tcp")
+        assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test.")
         assert local_dns("allowed.test", "+short").split() == [records["allowed.test"]]
         assert local_dns("example.local", "+short").split() == ["10.0.0.1"]
+        # The root is a name too.
+        assert "status: NXDOMAIN" in client.succeed("dig +time=2 +tries=1 @127.0.0.1 . NS")
         # And through glibc, which now resolves in-process via resolv.conf.
         expect_blocked("ads.hosts-format.test")
         expect_blocked("42.metrics.test")
@@ -517,6 +572,14 @@ in {
         client.succeed(f"{daemon_log()} | grep 'identified by uid only'")
         assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
         assert nss_as("carol", "alice-only.test") is None
+        # A dual-stack client (an IPv6 socket talking to the IPv4-mapped
+        # address) is identified from the IPv6 socket table, over UDP and TCP.
+        for transport in ["udp", "tcp"]:
+            mapped = f"dns-query-mapped alice-only.test {transport}"
+            alice = client.succeed(f"runuser -u alice -- {mapped}").strip()
+            assert alice == f"rcode=0 addresses={records['alice-only.test']}", alice
+            carol = client.succeed(f"runuser -u carol -- {mapped}").strip()
+            assert carol == "rcode=3 addresses=", carol
         # carol's gid and the caller's pid cannot be determined, so rules
         # on them cannot match.
         assert nss_as("carol", "staff-only.test") is None

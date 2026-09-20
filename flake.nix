@@ -62,6 +62,10 @@
         # lets QEMU fall back to emulation.  See "NixOS test" in AGENTS.md.
         checks.nixos-test = pkgs.testers.runNixOSTest ./nix/test.nix;
 
+        # The module's assertions, evaluated against accepted and refused
+        # configurations; nothing is built.
+        checks.module-assertions = pkgs.callPackage ./nix/module-tests.nix {};
+
         treefmt = {
           projectRootFile = "flake.nix";
 

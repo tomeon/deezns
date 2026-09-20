@@ -1,11 +1,11 @@
 # NixOS module for deezns: runs the daemon as a hardened systemd service and
-# plugs it into the system's name resolution in one of two ways.
+# plugs it into the system's name resolution in one of three ways.
 #
 # How NSS works on NixOS matters here.  Third-party NSS modules are not
 # loadable by arbitrary processes (glibc searches only its own lib directory
 # and LD_LIBRARY_PATH); NixOS instead lists them in `system.nssModules` and
 # points nscd (nsncd by default) at them, and every process' lookups go
-# through nscd's socket.  The module therefore offers two front-ends:
+# through nscd's socket.  The module therefore offers three front-ends:
 #
 #   * `frontend = "nscd"` (the default): the daemon itself answers on
 #     nscd's socket, /run/nscd/socket, and nsncd is moved to another path
@@ -371,7 +371,7 @@ in {
           assertion = config.services.nscd.enable;
           message = ''
             services.deezns needs services.nscd.enable: NixOS routes name
-            lookups through nscd, and both deezns front-ends build on that.
+            lookups through nscd, and every deezns front-end builds on that.
           '';
         }
         {
@@ -551,6 +551,16 @@ in {
             services.deezns.frontend = "dns" needs nsncd
             (services.nscd.enableNsncd), which can be told to leave host
             lookups to glibc with NSNCD_IGNORE_HOSTS.
+          '';
+        }
+        {
+          assertion = !config.services.resolved.enable;
+          message = ''
+            services.deezns.frontend = "dns" does not work with
+            systemd-resolved (services.resolved.enable): its stub resolver
+            would sit between the applications and the daemon, so every
+            query would identify systemd-resolved rather than the program
+            that asked, and its cache would be shared across users.
           '';
         }
       ];

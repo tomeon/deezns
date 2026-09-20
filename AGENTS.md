@@ -72,7 +72,15 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     `gid == -1` and `pid == -1`. The
     unit also gets `CAP_NET_BIND_SERVICE`, `AF_INET`/`AF_INET6` and
     `ProcSubset=all` (for `/proc/net`). This mode also covers programs
-    with their own DNS client.
+    with their own DNS client, and refuses systemd-resolved, whose stub
+    would hide the caller. Sockets are matched on the whole connection
+    across both address families' tables; sockets of different users
+    that fit equally well identify nobody.
+  - Names are canonicalised (lower-case, no trailing dot; the root is
+    `"."`) before rules and blocklists see them. Both listeners bound
+    their work (512 connections, 5 s deadlines) and the nscd front-end
+    validates the real nscd's host replies before relaying them, since
+    an empty or `found=-1` reply makes glibc bypass nscd.
   - `nss`: the package goes into `system.nssModules` and
     `deezns [!UNAVAIL=return]` into the `hosts` line at `nssOrder`.
     NixOS loads third-party NSS modules only inside nsncd, so the
@@ -89,6 +97,11 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   the lookup. The nscd front-end made it unnecessary; it is kept as a
   reference. The patch is a git format-patch against nsncd v1.5.2 and
   carries its own unit tests, which `nix build .#nsncd` runs.
+- `checks.<system>.module-assertions` is `nix/module-tests.nix`: it
+  evaluates the module against configurations that must be accepted or
+  refused (socket-path collisions, glibc's nscd, a missing DNS upstream,
+  systemd-resolved with the dns front-end) and fails the evaluation
+  otherwise. Add a case there whenever the module gains an assertion.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.
 - `checks.<system>.nixos-test` is `pkgs.testers.runNixOSTest ./nix/test.nix`:
