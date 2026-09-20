@@ -60,10 +60,8 @@
   capabilities =
     lib.optional dnsFrontend "CAP_NET_BIND_SERVICE"
     ++ lib.optionals (dnsFrontend && cfg.dns.identifyProcesses) ["CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE"];
-  capabilitySetting =
-    if capabilities == []
-    then ""
-    else lib.concatStringsSep " " capabilities;
+
+  capabilitySetting = lib.concatStringsSep " " capabilities;
 
   nscdEnvironment = config.systemd.services.nscd.environment;
   effectiveNsncdSocket = nscdEnvironment.NSNCD_SOCKET_PATH or null;
