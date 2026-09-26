@@ -11,7 +11,8 @@
 #
 # The client runs the default nscd front-end; specialisations switch it to
 # the NSS-module front-end and to a default-deny policy mid-test.
-{lib, ...}: let
+{localFlake}: {testers, ...}:
+testers.runNixOSTest ({lib, ...}: let
   # Every name the resolver serves, with its address.  Only these names
   # exist upstream; the expected NSS outcome is in the test script.
   records = {
@@ -72,7 +73,7 @@ in {
       pkgs,
       ...
     }: {
-      imports = [./module.nix];
+      imports = [localFlake.nixosModules.deezns];
 
       networking.nameservers = [nodes.resolver.networking.primaryIPAddress];
 
@@ -602,4 +603,4 @@ in {
         )
         expect_blocked("ads.hosts-format.test")
   '';
-}
+})

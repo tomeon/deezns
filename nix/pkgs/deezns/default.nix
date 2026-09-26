@@ -11,7 +11,9 @@
   # same value so the two cannot disagree.
   socketPath ? "/run/deezns/resolve.sock",
 }: let
-  cargoToml = lib.importTOML ../Cargo.toml;
+  root = ../../..;
+  expand = path: root + "/${toString path}";
+  cargoToml = lib.importTOML (expand "Cargo.toml");
 in
   rustPlatform.buildRustPackage {
     pname = cargoToml.package.name;
@@ -20,16 +22,16 @@ in
     # Only what cargo needs: editing the Nix files, the docs or the example
     # policy does not rebuild the package.
     src = lib.fileset.toSource {
-      root = ../.;
-      fileset = lib.fileset.unions [
-        ../Cargo.toml
-        ../Cargo.lock
-        ../build.rs
-        ../src
-      ];
+      inherit root;
+      fileset = lib.fileset.unions (map expand [
+        "Cargo.toml"
+        "Cargo.lock"
+        "build.rs"
+        "src"
+      ]);
     };
 
-    cargoLock.lockFile = ../Cargo.lock;
+    cargoLock.lockFile = expand "Cargo.lock";
 
     env.DEEZNS_SOCKET_PATH = socketPath;
 
@@ -39,7 +41,7 @@ in
       mv "$out/lib/libnss_deezns.so" "$out/lib/libnss_deezns.so.2"
       patchelf --set-soname libnss_deezns.so.2 "$out/lib/libnss_deezns.so.2"
 
-      install -Dm644 ${../config/policy.toml} "$out/share/doc/deezns/policy.toml"
+      install -Dm644 ${expand "config/policy.toml"} "$out/share/doc/deezns/policy.toml"
     '';
 
     # Lets the NixOS module find the socket without a second copy of the

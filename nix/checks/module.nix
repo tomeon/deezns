@@ -2,7 +2,7 @@
 # below must be accepted, or refused with an assertion that names the
 # problem.  Building the derivation forces the evaluation; nothing is built
 # beyond a file listing the outcomes.
-{
+{localFlake}: {
   lib,
   pkgs,
   runCommand,
@@ -12,7 +12,7 @@
       inherit (pkgs.stdenv.hostPlatform) system;
       modules =
         [
-          ./module.nix
+          localFlake.nixosModules.deezns
           {
             nixpkgs.pkgs = pkgs;
             system.stateVersion = lib.trivial.release;

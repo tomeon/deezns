@@ -21,10 +21,13 @@
   };
 
   outputs = inputs @ {flake-parts, ...}:
-    flake-parts.lib.mkFlake {inherit inputs;} ({config, ...}: {
+    flake-parts.lib.mkFlake {inherit inputs;} ({...}: {
       imports = [
         inputs.devshell.flakeModule
         inputs.treefmt-nix.flakeModule
+        ./nix/checks.nix
+        ./nix/nixos-modules.nix
+        ./nix/packages.nix
       ];
 
       # deezns is a glibc NSS module plus a daemon speaking SO_PEERCRED over
@@ -34,38 +37,11 @@
         "aarch64-linux"
       ];
 
-      flake.nixosModules = {
-        deezns.imports = [./nix/module.nix];
-        default = config.flake.nixosModules.deezns;
-      };
-
       perSystem = {
         config,
         pkgs,
         ...
       }: {
-        packages = {
-          deezns = pkgs.callPackage ./nix/package.nix {};
-          default = config.packages.deezns;
-
-          # nixpkgs' nsncd with a prototype patch that lets NSS modules loaded
-          # into it learn the credentials of the process whose lookup they
-          # are serving (see the patch header).  Not used by the NixOS module
-          # yet.
-          nsncd = pkgs.nsncd.overrideAttrs (previous: {
-            patches = (previous.patches or []) ++ [./nix/nsncd-peer-cred.patch];
-          });
-        };
-
-        # The VM test boots two machines (a resolver and a deezns client),
-        # so it needs KVM, or a builder that declares the `kvm` feature and
-        # lets QEMU fall back to emulation.  See "NixOS test" in AGENTS.md.
-        checks.nixos-test = pkgs.testers.runNixOSTest ./nix/test.nix;
-
-        # The module's assertions, evaluated against accepted and refused
-        # configurations; nothing is built.
-        checks.module-assertions = pkgs.callPackage ./nix/module-tests.nix {};
-
         treefmt = {
           projectRootFile = "flake.nix";
 
@@ -78,7 +54,14 @@
           programs.taplo.enable = true;
           # Nix
           programs.alejandra.enable = true;
-          programs.deadnix.enable = true;
+          programs.deadnix = {
+            enable = true;
+
+            # Don't break `moduleWithSystem`, which requires arguments to be
+            # named by the target function in order to supply them as
+            # arguments to that function.
+            no-lambda-pattern-names = true;
+          };
           programs.statix.enable = true;
           # Documentation (and the workflow YAML)
           programs.prettier.enable = true;
