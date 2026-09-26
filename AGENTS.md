@@ -47,11 +47,18 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
 - `nixosModules.deezns` (also `nixosModules.default`) is
   `nix/module.nix`: `services.deezns.{enable,package,frontend,settings}`
   plus a read-only `socketPath` taken from the package's
-  `passthru.socketPath`. The daemon runs as user `deezns` under a
+  `passthru.socketPath`. Daemon settings are declared once, as options
+  under `settings` (e.g. `settings.nscd_frontend.{listen,upstream}`,
+  `settings.dns_frontend.{listen,upstream}`), and the rest of the module
+  reads them from there; the module never assigns to `settings` itself.
+  Only the selected front-end's section is written to the policy file.
+  Top-level options are kept for what is not daemon configuration
+  (`frontend`, `dns.identifyProcesses`, `nssOrder`). The daemon runs as user `deezns` under a
   hardened systemd unit. `frontend` picks how glibc's lookups reach it:
-  - `nscd` (default): the daemon answers on `/run/nscd/socket` in
-    nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
-    moved to `/run/nsncd/socket` via `NSNCD_SOCKET_PATH`, with its
+  - `nscd` (default): the daemon answers on
+    `settings.nscd_frontend.listen` (`/run/nscd/socket`) in nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
+    moved to `settings.nscd_frontend.upstream` (`/run/nsncd/socket`) via
+    `NSNCD_SOCKET_PATH`, with its
     RuntimeDirectory forced to match. Host lookups are judged with the
     real caller's `SO_PEERCRED`; every other request is forwarded to
     nsncd byte for byte. Assertions require nsncd, keep the three socket
@@ -59,8 +66,8 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     `NSNCD_SOCKET_PATH`. A denial must be answered as `found=0` with
     `HOST_NOT_FOUND`: `found=-1` or a closed connection makes glibc
     bypass nscd for its next hundred lookups.
-  - `dns`: the daemon serves DNS on `services.deezns.dns.listen`
-    (`src/dns.rs`, UDP and TCP, forwarding to `dns.upstream`), is put
+  - `dns`: the daemon serves DNS on `settings.dns_frontend.listen`
+    (`src/dns.rs`, UDP and TCP, forwarding to `settings.dns_frontend.upstream`), is put
     first in `networking.nameservers`, and nscd.service gets
     `NSNCD_IGNORE_HOSTS=true` so glibc resolves in-process and the query
     leaves the caller's own socket. `src/identify.rs` reads the caller's

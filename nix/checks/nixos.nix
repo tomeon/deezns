@@ -209,10 +209,8 @@ in {
         dns = identifyProcesses: {
           services.deezns = {
             frontend = "dns";
-            dns = {
-              inherit identifyProcesses;
-              upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
-            };
+            dns = {inherit identifyProcesses;};
+            settings.dns_frontend.upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
           };
         };
       in {
