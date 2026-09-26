@@ -537,15 +537,20 @@ in {
         # tenth of it, so this fails once the unit scores above 2.0.
         client.succeed("systemd-analyze security --no-pager --threshold=20 deezns.service")
 
-    with subtest("Without the daemon, lookups fall through to dns"):
-        # Stopping the daemon removes /run/nscd/socket; glibc then resolves
-        # in-process, unfiltered.
+    with subtest("Without the daemon, glibc bypasses nscd but finds no other DNS server"):
+        # Stopping the daemon removes /run/nscd/socket, and glibc resolves
+        # in-process.  With the DNS front-end enabled, though, resolv.conf
+        # lists the daemon alone (openresolv drops the other nameservers
+        # when a local one is present), so nothing resolves at all.
+        client.succeed("test \"$(grep -c '^nameserver' /etc/resolv.conf)\" = 1")
         client.systemctl("stop deezns.service")
         client.fail("test -e /run/nscd/socket")
-        expect_resolved("ads.hosts-format.test")
+        assert nss("ads.hosts-format.test") is None
+        assert nss("unlisted.test") is None
         client.systemctl("start deezns.service")
         client.wait_for_file("/run/nscd/socket")
         expect_blocked("ads.hosts-format.test")
+        expect_resolved("unlisted.test")
 
     with subtest("With default_verdict = deny, unmatched names are refused"):
         client.succeed(f"{base_system}/specialisation/default-deny/bin/switch-to-configuration test")

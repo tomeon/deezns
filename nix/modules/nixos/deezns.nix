@@ -693,8 +693,10 @@ moduleWithSystem (
           NSNCD_IGNORE_HOSTS = "true";
         };
 
-        # First nameserver; any others remain as fallbacks glibc tries when
-        # the daemon does not answer.
+        # First nameserver.  openresolv then writes the daemon alone into
+        # resolv.conf (`resolv_conf_local_only` drops the other nameservers
+        # once a local one is present), so with the daemon down lookups
+        # fail rather than go around it.
         networking.nameservers = lib.mkBefore [listenAddress];
       })
 
