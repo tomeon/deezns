@@ -9,8 +9,9 @@
 # and through the client's glibc (which must answer or refuse exactly as
 # the policy says).
 #
-# The client runs the default nscd front-end; specialisations switch it to
-# the NSS-module front-end and to a default-deny policy mid-test.
+# The client runs all three front-ends at once (nscd, DNS and the NSS
+# module); specialisations switch it to a default-deny policy and to each
+# front-end on its own mid-test.
 {localFlake}: {testers, ...}:
 testers.runNixOSTest ({lib, ...}: let
   # Every name the resolver serves, with its address.  Only these names
@@ -80,6 +81,13 @@ in {
       services.deezns = {
         enable = true;
         settings = {
+          nscd_frontend.enable = true;
+          dns_frontend = {
+            enable = true;
+            upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
+          };
+          nss_frontend.enable = true;
+
           default_verdict = "passthrough";
 
           blocklists = [
@@ -204,20 +212,23 @@ in {
       };
 
       # Switched to mid-test: the same policy with the other default
-      # verdict, and the NSS-module front-end.
+      # verdict, and each front-end on its own.
       specialisation = let
-        dns = identifyProcesses: {
-          services.deezns = {
-            frontend = "dns";
-            dns = {inherit identifyProcesses;};
-            settings.dns_frontend.upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
+        only = frontend: {
+          services.deezns.settings = {
+            nscd_frontend.enable = lib.mkForce (frontend == "nscd");
+            dns_frontend.enable = lib.mkForce (frontend == "dns");
+            nss_frontend.enable = lib.mkForce (frontend == "nss");
           };
         };
       in {
         default-deny.configuration.services.deezns.settings.default_verdict = lib.mkForce "deny";
-        nss-module.configuration.services.deezns.frontend = "nss";
-        dns.configuration = dns false;
-        dns-ptrace.configuration = dns true;
+        nss-module.configuration = only "nss";
+        dns.configuration = only "dns";
+        dns-ptrace.configuration = lib.mkMerge [
+          (only "dns")
+          {services.deezns.settings.dns_frontend.identify_processes = true;}
+        ];
       };
 
       # A user that only nss-systemd knows, so `getent passwd dynuser`
@@ -364,6 +375,17 @@ in {
         return client.succeed(f"stat -c %U {path}").strip()
 
 
+    def daemon_log():
+        """journalctl restricted to the daemon's current instance."""
+        invocation = client.succeed("systemctl show -p InvocationID --value deezns").strip()
+        return f"journalctl _SYSTEMD_INVOCATION_ID={invocation}"
+
+
+    def local_dns(name, *args):
+        """Ask the daemon's DNS front-end directly, bypassing glibc."""
+        return client.succeed(f"dig +time=2 +tries=1 {' '.join(args)} @127.0.0.1 {name} A")
+
+
     start_all()
     resolver.wait_for_unit("dnsmasq.service")
     client.wait_for_unit("multi-user.target")
@@ -379,10 +401,20 @@ in {
         assert owner("/run/nscd/socket") == "deezns"
         assert owner("/run/nsncd/socket") == "nscd"
         client.succeed("systemctl show nscd -p Environment | grep NSNCD_SOCKET_PATH=/run/nsncd/socket")
-        client.fail("grep -E '^hosts:.*deezns' /etc/nsswitch.conf")
         client.succeed("journalctl -u deezns | grep 'listening (nscd front-end)'")
         client.succeed("journalctl -u deezns | grep 'policy engine ready'")
         assert client.succeed("journalctl -u deezns | grep -c 'loaded blocklist'").strip() == "3"
+
+    with subtest("... and serves DNS and the NSS module at the same time"):
+        client.wait_until_succeeds("dig +time=1 +tries=1 @127.0.0.1 allowed.test")
+        client.succeed("journalctl -u deezns | grep 'listening (DNS front-end)'")
+        client.succeed("grep -m1 '^nameserver' /etc/resolv.conf | grep -w 127.0.0.1")
+        client.succeed(
+            r"grep -E '^hosts:.* files .*deezns \[!UNAVAIL=return\] .*dns' /etc/nsswitch.conf"
+        )
+        # nsncd keeps resolving host lookups: the nscd front-end hands it
+        # the ones it lets through.
+        client.fail("systemctl show nscd -p Environment | grep NSNCD_IGNORE_HOSTS")
 
     with subtest("Requests deezns does not judge reach nsncd unchanged"):
         # alice is in /etc/passwd; dynuser exists only through nss-systemd,
@@ -465,6 +497,25 @@ in {
         }
         assert query("alice", "ads.hosts-format.test")["verdict"] == "Denied"
 
+    with subtest("Lookups nsncd makes for the nscd front-end are not judged again"):
+        # nsncd resolved alice's alice-only.test through the NSS module and
+        # then the DNS front-end; both relayed it instead of denying it to
+        # nsncd's user, as the rule for everyone but alice would.
+        nscd_uid = client.succeed("id -u nscd").strip()
+        relayed = f"{daemon_log()} | grep RELAYED | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid} '"
+        client.succeed(f"{relayed} | grep 'passing through'")
+        client.succeed(f"{relayed} | grep 'forwarding upstream'")
+        client.fail(f"{daemon_log()} | grep DENIED | grep 'peer.uid={nscd_uid} '")
+
+    with subtest("Programs with their own resolver meet the DNS front-end"):
+        assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test")
+        assert "status: NXDOMAIN" in local_dns("ads.hosts-format.test", "+tcp")
+        assert local_dns("allowed.test", "+short").split() == [records["allowed.test"]]
+        assert local_dns("example.local", "+short").split() == ["10.0.0.1"]
+        dig_as = "dig +short +time=2 +tries=1 @127.0.0.1 alice-only.test A"
+        assert client.succeed(f"runuser -u alice -- {dig_as}").split() == [records["alice-only.test"]]
+        assert client.succeed(f"runuser -u carol -- {dig_as}").split() == []
+
     with subtest("Only group members can talk to the daemon directly"):
         client.fail("runuser -u bob -- deezns-query allowed.test")
 
@@ -487,15 +538,20 @@ in {
         # tenth of it, so this fails once the unit scores above 2.0.
         client.succeed("systemd-analyze security --no-pager --threshold=20 deezns.service")
 
-    with subtest("Without the daemon, lookups fall through to dns"):
-        # Stopping the daemon removes /run/nscd/socket; glibc then resolves
-        # in-process, unfiltered.
+    with subtest("Without the daemon, glibc bypasses nscd but finds no other DNS server"):
+        # Stopping the daemon removes /run/nscd/socket, and glibc resolves
+        # in-process.  With the DNS front-end enabled, though, resolv.conf
+        # lists the daemon alone (openresolv drops the other nameservers
+        # when a local one is present), so nothing resolves at all.
+        client.succeed("test \"$(grep -c '^nameserver' /etc/resolv.conf)\" = 1")
         client.systemctl("stop deezns.service")
         client.fail("test -e /run/nscd/socket")
-        expect_resolved("ads.hosts-format.test")
+        assert nss("ads.hosts-format.test") is None
+        assert nss("unlisted.test") is None
         client.systemctl("start deezns.service")
         client.wait_for_file("/run/nscd/socket")
         expect_blocked("ads.hosts-format.test")
+        expect_resolved("unlisted.test")
 
     with subtest("With default_verdict = deny, unmatched names are refused"):
         client.succeed(f"{base_system}/specialisation/default-deny/bin/switch-to-configuration test")
@@ -507,7 +563,7 @@ in {
         expect_resolved("skip.passthrough.test")
         assert nss("example.local") == ["10.0.0.1"]
 
-    with subtest("The NSS-module front-end blocks the same names"):
+    with subtest("The NSS-module front-end on its own blocks the same names"):
         client.succeed(f"{base_system}/specialisation/nss-module/bin/switch-to-configuration test")
         client.wait_for_unit("deezns.service")
         client.wait_for_unit("nscd.service")
@@ -528,21 +584,10 @@ in {
         nscd_uid = client.succeed("id -u nscd").strip()
         assert nss_as("alice", "alice-only.test") is None
         client.succeed(
-            f"journalctl -u deezns | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid} '"
+            f"{daemon_log()} | grep DENIED | grep 'hostname=\"alice-only.test\"' | grep 'peer.uid={nscd_uid} '"
         )
 
-    def daemon_log():
-        """journalctl restricted to the daemon's current instance."""
-        invocation = client.succeed("systemctl show -p InvocationID --value deezns").strip()
-        return f"journalctl _SYSTEMD_INVOCATION_ID={invocation}"
-
-
-    def local_dns(name, *args):
-        """Ask the daemon's DNS front-end directly, bypassing glibc."""
-        return client.succeed(f"dig +time=2 +tries=1 {' '.join(args)} @127.0.0.1 {name} A")
-
-
-    with subtest("The DNS front-end judges queries from any resolver"):
+    with subtest("The DNS front-end on its own judges queries from any resolver"):
         client.succeed(f"{base_system}/specialisation/dns/bin/switch-to-configuration test")
         client.wait_for_unit("deezns.service")
         client.wait_for_unit("nscd.service")
@@ -567,7 +612,7 @@ in {
         assert nss("example.local") == ["10.0.0.1"]
         client.succeed("getent passwd dynuser")
 
-    with subtest("Without identifyProcesses the DNS front-end knows the caller's uid only"):
+    with subtest("Without identify_processes the DNS front-end knows the caller's uid only"):
         client.succeed(f"{daemon_log()} | grep 'identified by uid only'")
         assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
         assert nss_as("carol", "alice-only.test") is None
@@ -587,7 +632,7 @@ in {
             f"{daemon_log()} | grep 'hostname=\"staff-only.test\"' | grep 'peer.uid=1001 ' | grep 'peer.gid=-1 peer.pid=-1 '"
         )
 
-    with subtest("With identifyProcesses it knows the caller's gid and pid too"):
+    with subtest("With identify_processes it knows the caller's gid and pid too"):
         client.succeed(f"{base_system}/specialisation/dns-ptrace/bin/switch-to-configuration test")
         client.wait_for_unit("deezns.service")
         client.wait_until_succeeds("dig +time=1 +tries=1 @127.0.0.1 allowed.test")

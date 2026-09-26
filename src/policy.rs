@@ -102,12 +102,19 @@ pub struct BlocklistConfig {
     pub path: PathBuf,
 }
 
+fn enabled() -> bool {
+    true
+}
+
 /// The nscd-protocol front-end (see `nscd.rs`): deezns answers on the socket
 /// glibc's nscd client uses, applies the policy to host lookups with the
 /// real caller's credentials, and forwards everything else to the actual
 /// nscd listening at `upstream`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NscdFrontendConfig {
+    /// A section that is present is enabled unless it says otherwise.
+    #[serde(default = "enabled")]
+    pub enable: bool,
     /// Where to listen; glibc looks at `/var/run/nscd/socket`.
     pub listen: PathBuf,
     /// The real nscd (nsncd's `NSNCD_SOCKET_PATH`) that serves everything
@@ -120,13 +127,34 @@ pub struct NscdFrontendConfig {
 /// not answer itself to `upstream`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DnsFrontendConfig {
+    /// A section that is present is enabled unless it says otherwise.
+    #[serde(default = "enabled")]
+    pub enable: bool,
     /// Address and port to serve DNS on, over UDP and TCP.
     pub listen: SocketAddr,
-    /// The real DNS server for names the policy lets through.
-    pub upstream: SocketAddr,
+    /// The real DNS server for names the policy lets through; required
+    /// when the front-end is enabled.
+    #[serde(default)]
+    pub upstream: Option<SocketAddr>,
     /// How long to wait for the upstream before answering SERVFAIL.
     #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
+    /// Look for the process behind each query in `/proc/<pid>/fd`, to give
+    /// rules `gid` and `pid` as well as `uid`.  Needs `CAP_DAC_READ_SEARCH`
+    /// and `CAP_SYS_PTRACE` for other users' processes.
+    #[serde(default)]
+    pub identify_processes: bool,
+}
+
+/// The NSS module (`libnss_deezns.so.2`), which asks the daemon over its
+/// policy socket.  The daemon serves that socket regardless; the section
+/// says whether the module is in `nsswitch.conf`, which matters for how
+/// front-ends stack (see `relay.rs`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct NssFrontendConfig {
+    /// A section that is present is enabled unless it says otherwise.
+    #[serde(default = "enabled")]
+    pub enable: bool,
 }
 
 fn default_upstream_timeout_ms() -> u64 {
@@ -144,11 +172,19 @@ pub struct PolicyConfig {
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
 
+    /// The user nscd runs as.  Its lookups are relayed, not judged, by the
+    /// listeners behind an enabled front-end (see `relay.rs`).
+    #[serde(default)]
+    pub nscd_user: Option<String>,
+
     #[serde(default)]
     pub nscd_frontend: Option<NscdFrontendConfig>,
 
     #[serde(default)]
     pub dns_frontend: Option<DnsFrontendConfig>,
+
+    #[serde(default)]
+    pub nss_frontend: Option<NssFrontendConfig>,
 }
 
 impl PolicyConfig {
@@ -156,6 +192,21 @@ impl PolicyConfig {
     pub fn from_path(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
         Ok(toml::from_str(&text)?)
+    }
+
+    /// The nscd front-end, if enabled.
+    pub fn nscd(&self) -> Option<&NscdFrontendConfig> {
+        self.nscd_frontend.as_ref().filter(|front| front.enable)
+    }
+
+    /// The DNS front-end, if enabled.
+    pub fn dns(&self) -> Option<&DnsFrontendConfig> {
+        self.dns_frontend.as_ref().filter(|front| front.enable)
+    }
+
+    /// Whether the NSS module is in use.
+    pub fn nss(&self) -> bool {
+        self.nss_frontend.as_ref().is_some_and(|front| front.enable)
     }
 }
 
@@ -521,13 +572,37 @@ mod tests {
         "#,
         )
         .unwrap();
-        let front = cfg.dns_frontend.unwrap();
+        let front = cfg.dns().unwrap();
         assert_eq!(front.listen, "127.0.0.1:53".parse::<SocketAddr>().unwrap());
-        assert_eq!(
-            front.upstream,
-            "192.0.2.53:53".parse::<SocketAddr>().unwrap()
-        );
+        assert_eq!(front.upstream, Some("192.0.2.53:53".parse().unwrap()));
         assert_eq!(front.upstream_timeout_ms, 5000);
+        assert!(!front.identify_processes);
+    }
+
+    #[test]
+    fn front_ends_can_be_disabled_in_place() {
+        let cfg: PolicyConfig = toml::from_str(
+            r#"
+            [nscd_frontend]
+            enable = false
+            listen = "/run/nscd/socket"
+            upstream = "/run/nsncd/socket"
+
+            [dns_frontend]
+            enable = false
+            listen = "127.0.0.1:53"
+
+            [nss_frontend]
+            enable = false
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.nscd().is_none());
+        assert!(cfg.dns().is_none());
+        assert!(!cfg.nss());
+
+        let cfg: PolicyConfig = toml::from_str("[nss_frontend]").unwrap();
+        assert!(cfg.nss());
     }
 
     #[test]
@@ -590,7 +665,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        let front = cfg.nscd_frontend.unwrap();
+        let front = cfg.nscd().unwrap();
         assert_eq!(front.listen, PathBuf::from("/run/nscd/socket"));
         assert_eq!(front.upstream, PathBuf::from("/run/nsncd/socket"));
     }

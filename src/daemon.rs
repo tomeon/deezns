@@ -7,11 +7,13 @@ mod nscd;
 mod peercred;
 mod policy;
 mod protocol;
+mod relay;
 mod upstream;
 
 use peercred::peer_caller;
 use policy::{PolicyConfig, PolicyEngine, PolicyVerdict};
 use protocol::{ResolveRequest, ResolveResponse, SOCKET_PATH};
+use relay::{ListenerRelays, Relays};
 use upstream::upstream_resolve;
 
 use std::io;
@@ -27,9 +29,14 @@ use tracing::{error, info};
 // Policy socket: one JSON request per line, identified by SO_PEERCRED
 // ---------------------------------------------------------------------------
 
-async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io::Result<()> {
+async fn handle_connection(
+    stream: UnixStream,
+    engine: Arc<PolicyEngine>,
+    relays: Arc<Relays>,
+) -> io::Result<()> {
     let caller = peer_caller(&stream)?;
-    info!(?caller, "accepted connection");
+    let relayed = relays.contains(&caller);
+    info!(?caller, relayed, "accepted connection");
 
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -42,6 +49,19 @@ async fn handle_connection(stream: UnixStream, engine: Arc<PolicyEngine>) -> io:
                 continue;
             }
         };
+
+        if relayed {
+            info!(
+                hostname = req.hostname,
+                peer.uid = caller.uid_value(),
+                peer.pid = caller.pid_value(),
+                "RELAYED (judged by another front-end, passing through)"
+            );
+            let mut buf = serde_json::to_vec(&ResolveResponse::PassThrough)?;
+            buf.push(b'\n');
+            writer.write_all(&buf).await?;
+            continue;
+        }
 
         let verdict = engine.evaluate_for(&req.hostname, &caller);
 
@@ -115,12 +135,18 @@ fn bind_policy_socket() -> io::Result<UnixListener> {
     Ok(listener)
 }
 
-async fn serve_policy_socket(listener: UnixListener, engine: Arc<PolicyEngine>) -> io::Result<()> {
+async fn serve_policy_socket(
+    listener: UnixListener,
+    engine: Arc<PolicyEngine>,
+    relays: Relays,
+) -> io::Result<()> {
+    let relays = Arc::new(relays);
     loop {
         let (stream, _addr) = listener.accept().await?;
         let eng = Arc::clone(&engine);
+        let relays = Arc::clone(&relays);
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, eng).await {
+            if let Err(e) = handle_connection(stream, eng, relays).await {
                 error!(%e, "connection handler failed");
             }
         });
@@ -150,10 +176,15 @@ async fn main() -> io::Result<()> {
     let config = PolicyConfig::from_path(&config_path).map_err(invalid)?;
     let engine = Arc::new(PolicyEngine::from_config(&config).map_err(invalid)?);
 
+    // nscd's user is resolved before any socket is bound: with the nscd
+    // front-end, glibc would otherwise ask this very daemon, which is not
+    // serving yet.
+    let relays = ListenerRelays::for_config(&config)?;
+
     // Bind everything before serving anything, so a bad configuration fails
     // the whole daemon instead of half of it.
     let policy_listener = bind_policy_socket()?;
-    let nscd_front = match &config.nscd_frontend {
+    let nscd_front = match config.nscd() {
         Some(front_cfg) => {
             let front = Arc::new(nscd::Frontend::new(front_cfg, Arc::clone(&engine)));
             let listener = front.bind()?;
@@ -167,13 +198,15 @@ async fn main() -> io::Result<()> {
         None => None,
     };
 
-    let dns_front = match &config.dns_frontend {
+    let dns_front = match config.dns() {
         Some(front_cfg) => {
-            let front = Arc::new(dns::Frontend::new(front_cfg, Arc::clone(&engine)));
+            let front = Arc::new(
+                dns::Frontend::new(front_cfg, Arc::clone(&engine))?.with_relays(relays.dns),
+            );
             let (udp, tcp) = front.bind().await?;
             info!(
                 address = %front.listen_addr(),
-                upstream = %front_cfg.upstream,
+                upstream = %front.upstream_addr(),
                 "listening (DNS front-end)"
             );
             Some((front, udp, tcp))
@@ -182,7 +215,11 @@ async fn main() -> io::Result<()> {
     };
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(serve_policy_socket(policy_listener, engine));
+    tasks.spawn(serve_policy_socket(
+        policy_listener,
+        engine,
+        relays.policy_socket,
+    ));
     if let Some((front, listener)) = nscd_front {
         tasks.spawn(front.serve(listener));
     }

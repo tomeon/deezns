@@ -213,6 +213,7 @@ client (browsers, Go binaries) alike:
 listen = "127.0.0.1:53"
 upstream = "192.0.2.53:53"   # the real resolver
 upstream_timeout_ms = 5000   # optional
+identify_processes = false   # optional; see below
 ```
 
 A DNS query carries no credentials, so the caller is read off the socket
@@ -224,12 +225,13 @@ sent to), both tables are searched whatever the client's address family
 (a dual-stack IPv6 socket talking to an IPv4 listener appears in the
 IPv6 table with an IPv4-mapped address), and when sockets of different
 users fit equally well nobody is identified. Turning the inode into a
-process, and so into
-a `gid` and `pid`, means finding it under `/proc/<pid>/fd`. For another
-user's process that takes two capabilities: `CAP_DAC_READ_SEARCH` to
-list the fd directory (it is mode 0500 and owned by that user) and
-`CAP_SYS_PTRACE` to follow its links, the same reason `ss -p` wants
-root. Without them the daemon says so once at startup and rules see
+process, and so into a `gid` and `pid`, means finding it under
+`/proc/<pid>/fd`, which the daemon does only with `identify_processes =
+true`. For another user's process that takes two capabilities:
+`CAP_DAC_READ_SEARCH` to list the fd directory (it is mode 0500 and
+owned by that user) and `CAP_SYS_PTRACE` to follow its links, the same
+reason `ss -p` wants root. With the setting off, or without the
+capabilities, the daemon says so once at startup and rules see
 `gid == -1` and `pid == -1`. `uid` is `-1` only when no local socket
 matches the query, which does not happen for queries from this machine.
 
@@ -249,6 +251,46 @@ would sit between the applications and the daemon, so every query
 would identify `systemd-resolved` rather than the program that asked,
 and its cache would be shared across users. The NixOS module refuses
 that combination.
+
+## Combining front-ends
+
+The policy socket is always open. Each front-end has a section of its
+own, enabled when present unless it says `enable = false`, and any
+combination may be enabled. `[nss_frontend]` has nothing but `enable`:
+the NSS module needs no daemon-side listener beyond the policy socket,
+but whether it is in `nsswitch.conf` decides how the front-ends stack.
+
+Stacked, the front-ends meet one lookup in turn: glibc asks the nscd
+front-end, which hands what it lets through to nscd, which runs the NSS
+module and then `dns`, which asks the DNS front-end. Judged again at
+each step, the lookup would be seen as nscd's, and per-user rules would
+be undone. So, given the user nscd runs as, the daemon passes nscd's
+lookups through unjudged on the listeners behind an enabled front-end:
+on the policy socket behind the nscd front-end, and on the DNS
+front-end behind the nscd front-end or the NSS module:
+
+```toml
+nscd_user = "nscd"
+
+[nscd_frontend]
+listen = "/run/nscd/socket"
+upstream = "/run/nsncd/socket"
+
+[dns_frontend]
+listen = "127.0.0.1:53"
+upstream = "192.0.2.53:53"
+
+[nss_frontend]
+enable = false
+```
+
+The user is resolved when the daemon starts; one that does not exist
+stops it. For the NSS module to be passed through at the DNS front-end
+it must come before `dns` in the `hosts` line. The DNS front-end on its
+own relies on nscd leaving host lookups to glibc (nsncd's
+`NSNCD_IGNORE_HOSTS`); combined with the nscd front-end or the NSS
+module, nscd must keep resolving them. The NixOS module takes all of
+this from `services.deezns.settings`.
 
 ## Compile-time options
 

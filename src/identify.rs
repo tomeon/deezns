@@ -188,11 +188,21 @@ pub fn process_with_socket(inode: u64) -> Option<Process> {
 }
 
 /// Identify the process that sent from `peer` to `server` over
-/// `transport`: uid from the socket tables, and gid and pid when the
-/// owning process can be found.
-pub fn identify(transport: Transport, peer: SocketAddr, server: SocketAddr) -> Caller {
+/// `transport`: uid from the socket tables, and, with `processes`, gid and
+/// pid when the owning process can be found.
+pub fn identify(
+    transport: Transport,
+    peer: SocketAddr,
+    server: SocketAddr,
+    processes: bool,
+) -> Caller {
     let entries = socket_tables(transport);
     match find_socket(&entries, peer, server) {
+        SocketMatch::One(socket) if !processes => Caller {
+            uid: Some(socket.uid),
+            gid: None,
+            pid: None,
+        },
         SocketMatch::One(socket) => {
             let process = process_with_socket(socket.inode);
             let pid = process.as_ref().map(|p| p.pid());
@@ -326,11 +336,16 @@ mod tests {
         socket.connect((Ipv4Addr::LOCALHOST, 53)).unwrap();
         let local = socket.local_addr().unwrap();
 
-        let caller = identify(Transport::Udp, local, addr(SERVER));
+        let caller = identify(Transport::Udp, local, addr(SERVER), true);
         assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
         // Our own fd table is always readable, so the process is found.
         assert_eq!(caller.pid, Some(std::process::id() as i32));
         assert_eq!(caller.gid, Some(unsafe { libc::getegid() }));
+
+        // Asked not to look for processes, only the uid is known.
+        let caller = identify(Transport::Udp, local, addr(SERVER), false);
+        assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
+        assert_eq!((caller.gid, caller.pid), (None, None));
     }
 
     /// Kernels without IPv6 (some sandboxes) cannot run the dual-stack
@@ -358,7 +373,7 @@ mod tests {
         let seen_by_listener = SocketAddr::new(mapped.ip().to_canonical(), mapped.port());
         assert!(seen_by_listener.is_ipv4());
 
-        let caller = identify(Transport::Udp, seen_by_listener, addr(SERVER));
+        let caller = identify(Transport::Udp, seen_by_listener, addr(SERVER), true);
         assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
         assert_eq!(caller.pid, Some(std::process::id() as i32));
     }
@@ -370,14 +385,17 @@ mod tests {
         let client = TcpStream::connect(server).unwrap();
         let local = client.local_addr().unwrap();
 
-        let caller = identify(Transport::Tcp, local, server);
+        let caller = identify(Transport::Tcp, local, server, true);
         assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
         assert_eq!(caller.pid, Some(std::process::id() as i32));
 
         // The same client endpoint asked about from another server address
         // is not this connection.
         let other = SocketAddr::new(server.ip(), server.port() + 1);
-        assert_eq!(identify(Transport::Tcp, local, other), Caller::unknown());
+        assert_eq!(
+            identify(Transport::Tcp, local, other, true),
+            Caller::unknown()
+        );
 
         // Dual-stack TCP, seen by an IPv4 listener as an IPv4 peer.
         if !ipv6_available() {
@@ -394,6 +412,7 @@ mod tests {
             Transport::Tcp,
             seen_by_listener,
             addr(&format!("127.0.0.1:{}", v6_server.port())),
+            true,
         );
         assert_eq!(caller.uid, Some(unsafe { libc::geteuid() }));
     }
@@ -402,7 +421,7 @@ mod tests {
     fn an_unknown_socket_is_an_unknown_caller() {
         let peer = addr("192.0.2.77:1");
         assert_eq!(
-            identify(Transport::Udp, peer, addr(SERVER)),
+            identify(Transport::Udp, peer, addr(SERVER), true),
             Caller::unknown()
         );
     }

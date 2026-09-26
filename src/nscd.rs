@@ -780,6 +780,7 @@ mod tests {
         let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
         let front = Arc::new(Frontend::with_limits(
             &NscdFrontendConfig {
+                enable: true,
                 listen: temp_socket("front"),
                 upstream: upstream.to_path_buf(),
             },

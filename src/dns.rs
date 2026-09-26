@@ -5,8 +5,8 @@
 //! programs with their own DNS client alike.  A query carries no
 //! credentials, so the caller is identified from the socket it came out of
 //! (see `identify.rs`): the uid is always available, the gid and pid only
-//! when the daemon may read other processes' file descriptors
-//! (`CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`).
+//! with `identify_processes` and when the daemon may read other processes'
+//! file descriptors (`CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`).
 //!
 //! Denied names get NXDOMAIN, the daemon's own records are answered
 //! directly, and everything else is forwarded verbatim to the configured
@@ -14,6 +14,7 @@
 //! that does not answer yields SERVFAIL.  Only the question section is
 //! interpreted, so any record type and EDNS pass through untouched.  A
 //! query for the root is judged like any other, under the name `"."`.
+//! Queries from relay users (see `relay.rs`) are forwarded unjudged.
 //!
 //! The listeners are world-reachable, so their work is bounded: at most
 //! `max_connections` TCP connections and in-flight UDP queries at once, a
@@ -23,6 +24,7 @@
 
 use crate::identify::{identify, Transport};
 use crate::policy::{Caller, DnsFrontendConfig, PolicyEngine, PolicyVerdict};
+use crate::relay::Relays;
 use crate::upstream::upstream_resolve;
 
 use std::io;
@@ -215,15 +217,17 @@ pub fn formerr(raw: &[u8]) -> Vec<u8> {
 pub struct Frontend {
     listen: SocketAddr,
     upstream: SocketAddr,
+    identify_processes: bool,
     timeout: Duration,
     read_timeout: Duration,
     tcp_slots: Arc<Semaphore>,
     udp_slots: Arc<Semaphore>,
     engine: Arc<PolicyEngine>,
+    relays: Relays,
 }
 
 impl Frontend {
-    pub fn new(config: &DnsFrontendConfig, engine: Arc<PolicyEngine>) -> Self {
+    pub fn new(config: &DnsFrontendConfig, engine: Arc<PolicyEngine>) -> io::Result<Self> {
         Self::with_limits(
             config,
             engine,
@@ -238,16 +242,32 @@ impl Frontend {
         engine: Arc<PolicyEngine>,
         read_timeout: Duration,
         max_connections: usize,
-    ) -> Self {
-        Frontend {
+    ) -> io::Result<Self> {
+        let upstream = config.upstream.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the DNS front-end needs an upstream server",
+            )
+        })?;
+        if !config.identify_processes {
+            info!("identify_processes is off; DNS callers are identified by uid only");
+        }
+        Ok(Frontend {
             listen: config.listen,
-            upstream: config.upstream,
+            upstream,
+            identify_processes: config.identify_processes,
             timeout: Duration::from_millis(config.upstream_timeout_ms),
             read_timeout,
             tcp_slots: Arc::new(Semaphore::new(max_connections)),
             udp_slots: Arc::new(Semaphore::new(max_connections)),
             engine,
-        }
+            relays: Relays::default(),
+        })
+    }
+
+    /// Forward the queries of these users without judging them.
+    pub fn with_relays(self, relays: Relays) -> Self {
+        Frontend { relays, ..self }
     }
 
     pub async fn bind(&self) -> io::Result<(UdpSocket, TcpListener)> {
@@ -259,6 +279,10 @@ impl Frontend {
 
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen
+    }
+
+    pub fn upstream_addr(&self) -> SocketAddr {
+        self.upstream
     }
 
     pub async fn serve(self: Arc<Self>, udp: UdpSocket, tcp: TcpListener) -> io::Result<()> {
@@ -363,15 +387,29 @@ impl Frontend {
         };
 
         // Reading /proc is blocking work.
-        let caller = tokio::task::spawn_blocking(move || identify(transport, peer, server))
-            .await
-            .unwrap_or_else(|_| Caller::unknown());
+        let processes = self.identify_processes;
+        let caller =
+            tokio::task::spawn_blocking(move || identify(transport, peer, server, processes))
+                .await
+                .unwrap_or_else(|_| Caller::unknown());
         // The root has no labels; the policy knows it as ".".
         let hostname = if query.question.name.is_empty() {
             "."
         } else {
             query.question.name.as_str()
         };
+
+        if self.relays.contains(&caller) {
+            info!(
+                hostname,
+                qtype = query.question.qtype,
+                peer.uid = caller.uid_value(),
+                peer.gid = caller.gid_value(),
+                peer.pid = caller.pid_value(),
+                "RELAYED (judged by another front-end, forwarding upstream)"
+            );
+            return self.forward(&query, transport).await;
+        }
 
         match self.engine.evaluate_for(hostname, &caller) {
             PolicyVerdict::Denied(reason) => {
@@ -676,14 +714,27 @@ mod tests {
     const TEST_MAX_CONNECTIONS: usize = 4;
 
     async fn start_frontend(policy: &str, upstream: SocketAddr) -> Arc<Frontend> {
+        start_frontend_with(policy, upstream, Relays::default(), true).await
+    }
+
+    async fn start_frontend_with(
+        policy: &str,
+        upstream: SocketAddr,
+        relays: Relays,
+        identify_processes: bool,
+    ) -> Arc<Frontend> {
         let cfg: PolicyConfig = toml::from_str(policy).unwrap();
         let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
         let config = DnsFrontendConfig {
+            enable: true,
             listen: "127.0.0.1:0".parse().unwrap(),
-            upstream,
+            upstream: Some(upstream),
             upstream_timeout_ms: 300,
+            identify_processes,
         };
-        let front = Frontend::with_limits(&config, engine, TEST_READ_TIMEOUT, TEST_MAX_CONNECTIONS);
+        let front = Frontend::with_limits(&config, engine, TEST_READ_TIMEOUT, TEST_MAX_CONNECTIONS)
+            .unwrap()
+            .with_relays(relays);
         let (udp, tcp) = front.bind().await.unwrap();
         // Both sockets bound to port 0 get different ports; the test uses
         // the UDP one and connects TCP to the TCP one.
@@ -820,6 +871,50 @@ mod tests {
                 Transport::Udp,
                 front.listen_addr(),
             )
+            .await;
+        assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn without_identify_processes_only_the_uid_is_known() {
+        let upstream = FakeUpstream::start().await;
+        let front = start_frontend_with(
+            &policy_for_this_user(),
+            upstream.addr,
+            Relays::default(),
+            false,
+        )
+        .await;
+
+        // Our own socket, but gid and pid are unknown, so the allow rule
+        // does not match and the deny rule after it does.
+        let reply = ask_udp(&front, &build_query(40, "mine.test", TYPE_A)).await;
+        assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn queries_from_relays_are_forwarded_unjudged() {
+        let upstream = FakeUpstream::start().await;
+        let me = unsafe { libc::geteuid() };
+        let front = start_frontend_with(
+            &policy_for_this_user(),
+            upstream.addr,
+            Relays::from_uids([me]),
+            true,
+        )
+        .await;
+
+        // Denied for anyone else, but this process is a relay.
+        let query = build_query(30, "blocked.test", TYPE_A);
+        assert_eq!(ask_udp(&front, &query).await, canned_reply(&query));
+        let tcp_query = build_query(31, "blocked.test", TYPE_A);
+        assert_eq!(ask_tcp(&tcp_query).await, canned_reply(&tcp_query));
+        assert_eq!(upstream.seen(), vec![query.clone(), tcp_query]);
+
+        // A caller nobody can identify is never a relay.
+        let unknown_peer: SocketAddr = "192.0.2.77:1".parse().unwrap();
+        let reply = front
+            .respond(&query, unknown_peer, Transport::Udp, front.listen_addr())
             .await;
         assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
     }
