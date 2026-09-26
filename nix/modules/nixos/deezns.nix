@@ -35,11 +35,17 @@ moduleWithSystem (
     cfg = config.services.deezns;
 
     settingsFormat = pkgs.formats.toml {};
-    # TOML has no null; an unset optional section is simply left out.
-    policyFile = settingsFormat.generate "deezns-policy.toml" (lib.filterAttrs (_: v: v != null) cfg.settings);
+    # The daemon starts every front-end whose section is present, so only the
+    # selected one's is written out.
+    policyFile = settingsFormat.generate "deezns-policy.toml" (removeAttrs cfg.settings (
+      lib.optional (!nscdFrontend) "nscd_frontend" ++ lib.optional (!dnsFrontend) "dns_frontend"
+    ));
 
     # The name of a directory under /run, for RuntimeDirectory=.
     runtimeDirectoryOf = path: lib.removePrefix "/run/" (dirOf path);
+
+    nscdSettings = cfg.settings.nscd_frontend;
+    dnsSettings = cfg.settings.dns_frontend;
 
     nscdFrontend = cfg.frontend == "nscd";
     dnsFrontend = cfg.frontend == "dns";
@@ -48,7 +54,7 @@ moduleWithSystem (
     # The address part of "host:port" or "[v6]:port": everything before the
     # last colon, minus IPv6 brackets.
     listenAddress = let
-      parts = lib.splitString ":" cfg.dns.listen;
+      parts = lib.splitString ":" dnsSettings.listen;
       address = lib.concatStringsSep ":" (lib.init parts);
     in
       if lib.length parts < 2 || address == ""
@@ -125,14 +131,16 @@ moduleWithSystem (
           How lookups reach the daemon.
 
           `nscd`: the daemon listens on nscd's socket
-          ({option}`services.deezns.nscd.socketPath`) in place of nsncd,
-          which is moved to {option}`services.deezns.nscd.nsncdSocketPath`.
+          ({option}`services.deezns.settings.nscd_frontend.listen`) in place
+          of nsncd, which is moved to
+          {option}`services.deezns.settings.nscd_frontend.upstream`.
           Host lookups are judged with the credentials of the process that
           asked; all other requests are forwarded to nsncd unchanged.
           Requires nsncd ({option}`services.nscd.enableNsncd`).
 
-          `dns`: the daemon serves DNS on {option}`services.deezns.dns.listen`
-          and is made the first nameserver; nsncd stops handling host
+          `dns`: the daemon serves DNS on
+          {option}`services.deezns.settings.dns_frontend.listen` and is made
+          the first nameserver; nsncd stops handling host
           lookups so that glibc resolves in-process and every resolver on
           the machine, glibc or not, goes through the policy.  Callers are
           identified from their sockets: uid always, gid and pid with
@@ -143,57 +151,13 @@ moduleWithSystem (
           nsncd, the daemon then sees nsncd's uid, gid and pid for every
           lookup made through glibc; only clients of the daemon's own socket
           are identified individually.
+
+          Only the selected front-end's section of
+          {option}`services.deezns.settings` is written to the policy.
         '';
       };
 
-      nscd = {
-        socketPath = lib.mkOption {
-          type = lib.types.path;
-          default = "/run/nscd/socket";
-          description = ''
-            Where the daemon listens for glibc's nscd client when
-            {option}`services.deezns.frontend` is `nscd`.  glibc has this
-            path compiled in (`/var/run/nscd/socket`, and `/var/run` is
-            `/run`), so there is normally no reason to change it.
-          '';
-        };
-
-        nsncdSocketPath = lib.mkOption {
-          type = lib.types.path;
-          default = "/run/nsncd/socket";
-          description = ''
-            Where nsncd listens instead, and where the daemon forwards the
-            requests it does not answer itself.  Set on `nscd.service` as
-            `NSNCD_SOCKET_PATH`; must be under `/run` and differ from both
-            {option}`services.deezns.nscd.socketPath` and
-            {option}`services.deezns.socketPath`.
-          '';
-        };
-      };
-
       dns = {
-        listen = lib.mkOption {
-          type = lib.types.str;
-          default = "127.0.0.1:53";
-          description = ''
-            Address and port the daemon serves DNS on, over UDP and TCP, when
-            {option}`services.deezns.frontend` is `dns`.  glibc only ever
-            queries port 53; the daemon is granted `CAP_NET_BIND_SERVICE`
-            for it.  The address is put first in `networking.nameservers`.
-          '';
-        };
-
-        upstream = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "192.0.2.53:53";
-          description = ''
-            The real DNS server, as `address:port`, that answers the queries
-            the policy lets through.  Required when
-            {option}`services.deezns.frontend` is `dns`.
-          '';
-        };
-
         identifyProcesses = lib.mkOption {
           type = lib.types.bool;
           default = false;
@@ -304,47 +268,70 @@ moduleWithSystem (
               });
             };
 
-            dns_frontend = lib.mkOption {
-              default = null;
+            nscd_frontend = lib.mkOption {
+              default = {};
               description = ''
-                The daemon's DNS front-end.  Set by the module from
-                {option}`services.deezns.dns` when
+                The daemon's nscd-protocol front-end, written to the policy
+                when {option}`services.deezns.frontend` is `nscd`.
+              '';
+              type = lib.types.submodule {
+                options = {
+                  listen = lib.mkOption {
+                    type = lib.types.path;
+                    default = "/run/nscd/socket";
+                    description = ''
+                      The socket glibc's nscd client connects to, where the
+                      daemon listens in nsncd's place.  glibc has this path
+                      compiled in (`/var/run/nscd/socket`, and `/var/run` is
+                      `/run`), so there is normally no reason to change it.
+                    '';
+                  };
+                  upstream = lib.mkOption {
+                    type = lib.types.path;
+                    default = "/run/nsncd/socket";
+                    description = ''
+                      Where nsncd listens instead, and where the daemon
+                      forwards the requests it does not answer itself.  Set on
+                      `nscd.service` as `NSNCD_SOCKET_PATH`; must be under
+                      `/run` and differ from both `listen` and
+                      {option}`services.deezns.socketPath`.
+                    '';
+                  };
+                };
+              };
+            };
+
+            dns_frontend = lib.mkOption {
+              default = {};
+              description = ''
+                The daemon's DNS front-end, written to the policy when
                 {option}`services.deezns.frontend` is `dns`.
               '';
-              type = lib.types.nullOr (lib.types.submodule {
+              type = lib.types.submodule {
                 freeformType = settingsFormat.type;
                 options = {
                   listen = lib.mkOption {
                     type = lib.types.str;
-                    description = "Address and port to serve DNS on.";
+                    default = "127.0.0.1:53";
+                    description = ''
+                      Address and port to serve DNS on, over UDP and TCP.
+                      glibc only ever queries port 53; the daemon is granted
+                      `CAP_NET_BIND_SERVICE` for it.  The address is put first
+                      in `networking.nameservers`.
+                    '';
                   };
                   upstream = lib.mkOption {
-                    type = lib.types.str;
-                    description = "The DNS server that answers what deezns does not.";
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                    example = "192.0.2.53:53";
+                    description = ''
+                      The real DNS server, as `address:port`, that answers the
+                      queries the policy lets through.  Required when
+                      {option}`services.deezns.frontend` is `dns`.
+                    '';
                   };
                 };
-              });
-            };
-
-            nscd_frontend = lib.mkOption {
-              default = null;
-              description = ''
-                The daemon's nscd-protocol front-end.  Set by the module from
-                {option}`services.deezns.nscd` when
-                {option}`services.deezns.frontend` is `nscd`.
-              '';
-              type = lib.types.nullOr (lib.types.submodule {
-                options = {
-                  listen = lib.mkOption {
-                    type = lib.types.path;
-                    description = "The socket glibc's nscd client connects to.";
-                  };
-                  upstream = lib.mkOption {
-                    type = lib.types.path;
-                    description = "The real nscd that answers what deezns does not.";
-                  };
-                };
-              });
+              };
             };
           };
         };
@@ -480,22 +467,22 @@ moduleWithSystem (
             '';
           }
           {
-            assertion = lib.hasPrefix "/run/" cfg.nscd.socketPath && lib.hasPrefix "/run/" cfg.nscd.nsncdSocketPath;
+            assertion = lib.hasPrefix "/run/" nscdSettings.listen && lib.hasPrefix "/run/" nscdSettings.upstream;
             message = ''
-              services.deezns.nscd.socketPath and nsncdSocketPath must be
-              under /run, where the services' RuntimeDirectories are created.
+              services.deezns.settings.nscd_frontend.listen and upstream must
+              be under /run, where the services' RuntimeDirectories are created.
             '';
           }
           {
-            assertion = lib.length (lib.unique [cfg.socketPath cfg.nscd.socketPath cfg.nscd.nsncdSocketPath]) == 3;
+            assertion = lib.length (lib.unique [cfg.socketPath nscdSettings.listen nscdSettings.upstream]) == 3;
             message = ''
               services.deezns: the daemon's policy socket (${cfg.socketPath}),
-              its nscd socket (${cfg.nscd.socketPath}) and nsncd's socket
-              (${cfg.nscd.nsncdSocketPath}) must be three different paths.
+              its nscd socket (${nscdSettings.listen}) and nsncd's socket
+              (${nscdSettings.upstream}) must be three different paths.
             '';
           }
           {
-            assertion = effectiveNsncdSocket != cfg.nscd.socketPath && effectiveNsncdSocket != cfg.socketPath;
+            assertion = effectiveNsncdSocket != nscdSettings.listen && effectiveNsncdSocket != cfg.socketPath;
             message = ''
               services.deezns: nscd.service's NSNCD_SOCKET_PATH
               (${toString effectiveNsncdSocket}) is one of the daemon's own
@@ -503,46 +490,43 @@ moduleWithSystem (
             '';
           }
           {
-            assertion = effectiveNsncdSocket == cfg.nscd.nsncdSocketPath;
+            assertion = effectiveNsncdSocket == nscdSettings.upstream;
             message = ''
               services.deezns: nscd.service's NSNCD_SOCKET_PATH
               (${toString effectiveNsncdSocket}) differs from
-              services.deezns.nscd.nsncdSocketPath (${cfg.nscd.nsncdSocketPath}),
-              where the daemon forwards requests.  Set the deezns option
-              rather than the environment variable.
+              services.deezns.settings.nscd_frontend.upstream
+              (${nscdSettings.upstream}), where the daemon forwards requests.
+              Set the deezns option rather than the environment variable.
             '';
           }
         ];
 
-        services.deezns.settings.nscd_frontend = {
-          listen = cfg.nscd.socketPath;
-          upstream = cfg.nscd.nsncdSocketPath;
-        };
-
         # nsncd moves out of the way; its runtime directory follows its
         # socket so the two services never share one.
         systemd.services.nscd = {
-          environment.NSNCD_SOCKET_PATH = cfg.nscd.nsncdSocketPath;
-          serviceConfig.RuntimeDirectory = lib.mkForce (runtimeDirectoryOf cfg.nscd.nsncdSocketPath);
+          environment.NSNCD_SOCKET_PATH = nscdSettings.upstream;
+          serviceConfig.RuntimeDirectory = lib.mkForce (runtimeDirectoryOf nscdSettings.upstream);
         };
 
-        systemd.services.deezns.serviceConfig.RuntimeDirectory = [(runtimeDirectoryOf cfg.nscd.socketPath)];
+        systemd.services.deezns.serviceConfig.RuntimeDirectory = [(runtimeDirectoryOf nscdSettings.listen)];
       })
 
       # ── DNS front-end ─────────────────────────────────────────────────
       (lib.mkIf dnsFrontend {
         assertions = [
           {
-            assertion = cfg.dns.upstream != null;
+            assertion = dnsSettings.upstream != null;
             message = ''
-              services.deezns.frontend = "dns" needs services.deezns.dns.upstream,
-              the DNS server that answers the queries the policy lets through.
+              services.deezns.frontend = "dns" needs
+              services.deezns.settings.dns_frontend.upstream, the DNS server
+              that answers the queries the policy lets through.
             '';
           }
           {
             assertion = listenAddress != null;
             message = ''
-              services.deezns.dns.listen (${cfg.dns.listen}) must be "address:port".
+              services.deezns.settings.dns_frontend.listen (${dnsSettings.listen})
+              must be "address:port".
             '';
           }
           {
@@ -564,11 +548,6 @@ moduleWithSystem (
             '';
           }
         ];
-
-        services.deezns.settings.dns_frontend = {
-          listen = cfg.dns.listen;
-          upstream = cfg.dns.upstream;
-        };
 
         # nsncd answers nothing for host lookups, so glibc performs them in
         # each process itself, through resolv.conf, and the DNS query leaves

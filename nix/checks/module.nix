@@ -44,7 +44,7 @@
     services.deezns = {
       enable = true;
       frontend = "dns";
-      dns.upstream = "192.0.2.53:53";
+      settings.dns_frontend.upstream = "192.0.2.53:53";
     };
   };
 
@@ -83,7 +83,7 @@
       {
         services.deezns = {
           enable = true;
-          nscd.nsncdSocketPath = "/run/nscd/socket";
+          settings.nscd_frontend.upstream = "/run/nscd/socket";
         };
       }
     ])
@@ -91,7 +91,7 @@
       {
         services.deezns = {
           enable = true;
-          nscd.nsncdSocketPath = "/var/run/nsncd/socket";
+          settings.nscd_frontend.upstream = "/var/run/nsncd/socket";
         };
       }
     ])
@@ -108,7 +108,7 @@
         system.nssModules = lib.mkForce [];
       }
     ])
-    (refuses "dns front-end without an upstream" "dns.upstream" [
+    (refuses "dns front-end without an upstream" "dns_frontend.upstream" [
       {
         services.deezns = {
           enable = true;
@@ -116,7 +116,7 @@
         };
       }
     ])
-    (refuses "dns front-end with a malformed listen address" "address:port" [dns {services.deezns.dns.listen = "nonsense";}])
+    (refuses "dns front-end with a malformed listen address" "address:port" [dns {services.deezns.settings.dns_frontend.listen = "nonsense";}])
     (refuses "dns front-end with systemd-resolved" "systemd-resolved" [dns {services.resolved.enable = true;}])
   ];
 in
