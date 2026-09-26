@@ -14,6 +14,7 @@
 //! that does not answer yields SERVFAIL.  Only the question section is
 //! interpreted, so any record type and EDNS pass through untouched.  A
 //! query for the root is judged like any other, under the name `"."`.
+//! Queries from relay users (see `relay.rs`) are forwarded unjudged.
 //!
 //! The listeners are world-reachable, so their work is bounded: at most
 //! `max_connections` TCP connections and in-flight UDP queries at once, a
@@ -23,6 +24,7 @@
 
 use crate::identify::{identify, Transport};
 use crate::policy::{Caller, DnsFrontendConfig, PolicyEngine, PolicyVerdict};
+use crate::relay::Relays;
 use crate::upstream::upstream_resolve;
 
 use std::io;
@@ -220,6 +222,7 @@ pub struct Frontend {
     tcp_slots: Arc<Semaphore>,
     udp_slots: Arc<Semaphore>,
     engine: Arc<PolicyEngine>,
+    relays: Relays,
 }
 
 impl Frontend {
@@ -247,7 +250,13 @@ impl Frontend {
             tcp_slots: Arc::new(Semaphore::new(max_connections)),
             udp_slots: Arc::new(Semaphore::new(max_connections)),
             engine,
+            relays: Relays::default(),
         }
+    }
+
+    /// Forward the queries of these users without judging them.
+    pub fn with_relays(self, relays: Relays) -> Self {
+        Frontend { relays, ..self }
     }
 
     pub async fn bind(&self) -> io::Result<(UdpSocket, TcpListener)> {
@@ -372,6 +381,18 @@ impl Frontend {
         } else {
             query.question.name.as_str()
         };
+
+        if self.relays.contains(&caller) {
+            info!(
+                hostname,
+                qtype = query.question.qtype,
+                peer.uid = caller.uid_value(),
+                peer.gid = caller.gid_value(),
+                peer.pid = caller.pid_value(),
+                "RELAYED (judged by another front-end, forwarding upstream)"
+            );
+            return self.forward(&query, transport).await;
+        }
 
         match self.engine.evaluate_for(hostname, &caller) {
             PolicyVerdict::Denied(reason) => {
@@ -676,14 +697,24 @@ mod tests {
     const TEST_MAX_CONNECTIONS: usize = 4;
 
     async fn start_frontend(policy: &str, upstream: SocketAddr) -> Arc<Frontend> {
+        start_frontend_relaying(policy, upstream, Relays::default()).await
+    }
+
+    async fn start_frontend_relaying(
+        policy: &str,
+        upstream: SocketAddr,
+        relays: Relays,
+    ) -> Arc<Frontend> {
         let cfg: PolicyConfig = toml::from_str(policy).unwrap();
         let engine = Arc::new(PolicyEngine::from_config(&cfg).unwrap());
         let config = DnsFrontendConfig {
             listen: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout_ms: 300,
+            relay_users: vec![],
         };
-        let front = Frontend::with_limits(&config, engine, TEST_READ_TIMEOUT, TEST_MAX_CONNECTIONS);
+        let front = Frontend::with_limits(&config, engine, TEST_READ_TIMEOUT, TEST_MAX_CONNECTIONS)
+            .with_relays(relays);
         let (udp, tcp) = front.bind().await.unwrap();
         // Both sockets bound to port 0 get different ports; the test uses
         // the UDP one and connects TCP to the TCP one.
@@ -820,6 +851,32 @@ mod tests {
                 Transport::Udp,
                 front.listen_addr(),
             )
+            .await;
+        assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
+    }
+
+    #[tokio::test]
+    async fn queries_from_relays_are_forwarded_unjudged() {
+        let upstream = FakeUpstream::start().await;
+        let me = unsafe { libc::geteuid() };
+        let front = start_frontend_relaying(
+            &policy_for_this_user(),
+            upstream.addr,
+            Relays::from_uids([me]),
+        )
+        .await;
+
+        // Denied for anyone else, but this process is a relay.
+        let query = build_query(30, "blocked.test", TYPE_A);
+        assert_eq!(ask_udp(&front, &query).await, canned_reply(&query));
+        let tcp_query = build_query(31, "blocked.test", TYPE_A);
+        assert_eq!(ask_tcp(&tcp_query).await, canned_reply(&tcp_query));
+        assert_eq!(upstream.seen(), vec![query.clone(), tcp_query]);
+
+        // A caller nobody can identify is never a relay.
+        let unknown_peer: SocketAddr = "192.0.2.77:1".parse().unwrap();
+        let reply = front
+            .respond(&query, unknown_peer, Transport::Udp, front.listen_addr())
             .await;
         assert_eq!(rcode(&reply), RCODE_NXDOMAIN);
     }

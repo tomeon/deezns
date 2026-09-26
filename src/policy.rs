@@ -127,6 +127,19 @@ pub struct DnsFrontendConfig {
     /// How long to wait for the upstream before answering SERVFAIL.
     #[serde(default = "default_upstream_timeout_ms")]
     pub upstream_timeout_ms: u64,
+    /// Users whose queries are forwarded without evaluating the rules,
+    /// because another front-end judged them already (see `relay.rs`).
+    #[serde(default)]
+    pub relay_users: Vec<String>,
+}
+
+/// The daemon's own socket, which the NSS module and direct clients use.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PolicySocketConfig {
+    /// Users whose lookups are passed through without evaluating the rules,
+    /// because another front-end judged them already (see `relay.rs`).
+    #[serde(default)]
+    pub relay_users: Vec<String>,
 }
 
 fn default_upstream_timeout_ms() -> u64 {
@@ -143,6 +156,9 @@ pub struct PolicyConfig {
 
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
+
+    #[serde(default)]
+    pub policy_socket: PolicySocketConfig,
 
     #[serde(default)]
     pub nscd_frontend: Option<NscdFrontendConfig>,

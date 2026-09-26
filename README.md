@@ -250,6 +250,40 @@ would identify `systemd-resolved` rather than the program that asked,
 and its cache would be shared across users. The NixOS module refuses
 that combination.
 
+## Combining front-ends
+
+The policy socket is always open, and the `[nscd_frontend]` and
+`[dns_frontend]` sections may both be present, with the NSS module in
+`nsswitch.conf` as well. Stacked, the front-ends meet one lookup in
+turn: glibc asks the nscd front-end, which hands what it lets through
+to nscd, which runs the NSS module and then `dns`, which asks the DNS
+front-end. Judged again at each step, the lookup would be seen as
+nscd's, and per-user rules would be undone. So a listener can be told
+which users are relays, acting for callers another front-end has
+already judged; their lookups pass through it without evaluating the
+rules:
+
+```toml
+[policy_socket]
+relay_users = ["nscd"]   # behind the nscd front-end
+
+[dns_frontend]
+listen = "127.0.0.1:53"
+upstream = "192.0.2.53:53"
+relay_users = ["nscd"]   # behind the nscd front-end or the NSS module
+```
+
+User names are resolved when the daemon starts; one that does not exist
+stops it. A relay's lookups get a pass-through verdict on the policy
+socket and are forwarded upstream by the DNS front-end. For the NSS
+module to be relayed at the DNS front-end it must come before `dns` in
+the `hosts` line. The DNS front-end on its own relies on nscd leaving
+host lookups to glibc (nsncd's `NSNCD_IGNORE_HOSTS`); combined with the
+nscd front-end or the NSS module, nscd must keep resolving them. The
+NixOS module sets all of this from `services.deezns.nscd.enable`,
+`services.deezns.dns.enable` and `services.deezns.nss.enable`, which
+may be enabled in any combination.
+
 ## Compile-time options
 
 | Environment variable | Default                    | Purpose          |
