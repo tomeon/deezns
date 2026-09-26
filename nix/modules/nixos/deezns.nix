@@ -1,28 +1,27 @@
 # NixOS module for deezns: runs the daemon as a hardened systemd service and
-# plugs it into the system's name resolution in any combination of three
-# ways.
+# plugs it into the system's name resolution.
 #
 # How NSS works on NixOS matters here.  Third-party NSS modules are not
 # loadable by arbitrary processes (glibc searches only its own lib directory
 # and LD_LIBRARY_PATH); NixOS instead lists them in `system.nssModules` and
 # points nscd (nsncd by default) at them, and every process' lookups go
-# through nscd's socket.  The module therefore offers three front-ends,
-# each enabled on its own:
+# through nscd's socket.  The daemon has three front-ends, each a section of
+# its settings with its own `enable`, in any combination:
 #
-#   * `nscd.enable` (the default): the daemon itself answers on nscd's
-#     socket, /run/nscd/socket, and nsncd is moved to another path behind
-#     it.  Host lookups are judged with the credentials of the process that
-#     asked; everything else is forwarded to nsncd unchanged.
+#   * `nscd_frontend` (enabled by default): the daemon itself answers on
+#     nscd's socket, /run/nscd/socket, and nsncd is moved to another path
+#     behind it.  Host lookups are judged with the credentials of the
+#     process that asked; everything else is forwarded to nsncd unchanged.
 #
-#   * `dns.enable`: the daemon is the machine's DNS server on loopback.
+#   * `dns_frontend`: the daemon is the machine's DNS server on loopback.
 #     Callers are identified from their sockets: uid always, gid and pid
-#     only when the daemon is granted CAP_DAC_READ_SEARCH and
-#     CAP_SYS_PTRACE.  Programs with their own DNS client are covered too.
-#     On its own, it also makes nsncd stop handling host lookups
-#     (`NSNCD_IGNORE_HOSTS`), so glibc resolves in-process through
-#     resolv.conf and each query comes from the caller's own socket.
+#     with `identify_processes`, for which the unit is granted
+#     CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE.  Programs with their own DNS
+#     client are covered too.  On its own, it also makes nsncd stop handling
+#     host lookups (`NSNCD_IGNORE_HOSTS`), so glibc resolves in-process
+#     through resolv.conf and each query comes from the caller's own socket.
 #
-#   * `nss.enable`: the classic arrangement, libnss_deezns.so.2 in
+#   * `nss_frontend`: the classic arrangement, libnss_deezns.so.2 in
 #     nsswitch.conf.  On NixOS it runs inside nsncd, so `uid`, `gid` and
 #     `pid` carry nsncd's credentials for every lookup made through glibc;
 #     hostname and blocklist rules work as documented.
@@ -31,14 +30,9 @@
 #
 #   glibc -> [nscd front-end] -> nsncd -> [NSS module] -> dns -> [DNS front-end]
 #
-# nsncd resolves the host lookups the nscd front-end lets through, so with
-# the nscd front-end enabled nsncd keeps handling hosts, and its user is a
-# relay (the daemon's `relay_users`) on the policy socket and the DNS
-# front-end: what it asks there has been judged, with better credentials,
-# already.  Likewise the NSS module comes before `dns`, so with the NSS
-# module and the DNS front-end both enabled, nsncd keeps handling hosts and
-# its DNS queries are relayed.  Programs with their own DNS client still
-# meet the DNS front-end first.
+# The daemon treats `nscd_user` as a relay on the listeners behind an
+# enabled front-end (see src/relay.rs); the module keeps nsncd resolving
+# host lookups whenever the nscd front-end or the NSS module needs it to.
 {moduleWithSystem}:
 moduleWithSystem (
   {config, ...} @ perSystem: {
@@ -48,21 +42,19 @@ moduleWithSystem (
     ...
   }: let
     cfg = config.services.deezns;
+    inherit (cfg.settings) nscd_frontend dns_frontend;
 
     settingsFormat = pkgs.formats.toml {};
-    # TOML has no null; an unset optional section is simply left out.
-    policyFile = settingsFormat.generate "deezns-policy.toml" (lib.filterAttrs (_: v: v != null) cfg.settings);
+    # TOML has no null; unset optional settings are simply left out.
+    policyFile = settingsFormat.generate "deezns-policy.toml" (lib.filterAttrsRecursive (_: v: v != null) cfg.settings);
 
     # The name of a directory under /run, for RuntimeDirectory=.
     runtimeDirectoryOf = path: lib.removePrefix "/run/" (dirOf path);
 
-    nscdFrontend = cfg.nscd.enable;
-    dnsFrontend = cfg.dns.enable;
-    nssFrontend = cfg.nss.enable;
+    nscdFrontend = nscd_frontend.enable;
+    dnsFrontend = dns_frontend.enable;
+    nssFrontend = cfg.settings.nss_frontend.enable;
 
-    # nsncd's user, whose lookups on behalf of callers a front-end in front
-    # of it has judged already (see the top of this file).
-    nsncdUser = config.services.nscd.user;
     # `dns` in the `hosts` line of nsswitch.conf, as NixOS orders it
     # (nixos/modules/config/nsswitch.nix).
     dnsNssOrder = 1499;
@@ -70,7 +62,7 @@ moduleWithSystem (
     # The address part of "host:port" or "[v6]:port": everything before the
     # last colon, minus IPv6 brackets.
     listenAddress = let
-      parts = lib.splitString ":" cfg.dns.listen;
+      parts = lib.splitString ":" dns_frontend.listen;
       address = lib.concatStringsSep ":" (lib.init parts);
     in
       if lib.length parts < 2 || address == ""
@@ -83,22 +75,13 @@ moduleWithSystem (
     # CAP_SYS_PTRACE).
     capabilities =
       lib.optional dnsFrontend "CAP_NET_BIND_SERVICE"
-      ++ lib.optionals (dnsFrontend && cfg.dns.identifyProcesses) ["CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE"];
+      ++ lib.optionals (dnsFrontend && dns_frontend.identify_processes) ["CAP_DAC_READ_SEARCH" "CAP_SYS_PTRACE"];
 
     capabilitySetting = lib.concatStringsSep " " capabilities;
 
     nscdEnvironment = config.systemd.services.nscd.environment;
     effectiveNsncdSocket = nscdEnvironment.NSNCD_SOCKET_PATH or null;
   in {
-    imports = [
-      (lib.mkRemovedOptionModule ["services" "deezns" "frontend"] ''
-        The front-ends are now enabled independently, and may be combined:
-        use services.deezns.nscd.enable (on by default),
-        services.deezns.dns.enable and services.deezns.nss.enable.
-      '')
-      (lib.mkRenamedOptionModule ["services" "deezns" "nssOrder"] ["services" "deezns" "nss" "order"])
-    ];
-
     options.services.deezns = {
       enable = lib.mkEnableOption "deezns, a DNS policy daemon consulted by glibc through nscd or an NSS module";
 
@@ -149,151 +132,27 @@ moduleWithSystem (
         '';
       };
 
-      nscd = {
-        enable = lib.mkOption {
-          type = lib.types.bool;
-          default = true;
-          description = ''
-            The nscd front-end: the daemon listens on nscd's socket
-            ({option}`services.deezns.nscd.socketPath`) in place of nsncd,
-            which is moved to {option}`services.deezns.nscd.nsncdSocketPath`.
-            Host lookups are judged with the credentials of the process that
-            asked; all other requests are forwarded to nsncd unchanged.
-            Requires nsncd ({option}`services.nscd.enableNsncd`).
+      nssOrder = lib.mkOption {
+        type = lib.types.int;
+        default =
+          if config.services.resolved.enable
+          then 500
+          else 1000;
+        defaultText = lib.literalExpression "if config.services.resolved.enable then 500 else 1000";
+        description = ''
+          With {option}`services.deezns.settings.nss_frontend.enable` set: the
+          position of `deezns` in the `hosts` line of `/etc/nsswitch.conf`, as
+          a `lib.mkOrder` priority.  NixOS places `mymachines` at 400,
+          `resolve` at 501, `files` at 998, `myhostname` at 999 and `dns` at
+          1499.
 
-            The lookups it lets through are resolved by nsncd, through the
-            NSS module and the DNS front-end when those are enabled too;
-            they pass through both unjudged, since the nscd front-end has
-            judged them with the caller's own credentials.
-
-            Any combination of the three front-ends may be enabled, none
-            included, which leaves only the daemon's own socket.
-          '';
-        };
-
-        socketPath = lib.mkOption {
-          type = lib.types.path;
-          default = "/run/nscd/socket";
-          description = ''
-            Where the daemon listens for glibc's nscd client when
-            {option}`services.deezns.nscd.enable` is set.  glibc has this
-            path compiled in (`/var/run/nscd/socket`, and `/var/run` is
-            `/run`), so there is normally no reason to change it.
-          '';
-        };
-
-        nsncdSocketPath = lib.mkOption {
-          type = lib.types.path;
-          default = "/run/nsncd/socket";
-          description = ''
-            Where nsncd listens instead, and where the daemon forwards the
-            requests it does not answer itself.  Set on `nscd.service` as
-            `NSNCD_SOCKET_PATH`; must be under `/run` and differ from both
-            {option}`services.deezns.nscd.socketPath` and
-            {option}`services.deezns.socketPath`.
-          '';
-        };
-      };
-
-      dns = {
-        enable = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-          description = ''
-            The DNS front-end: the daemon serves DNS on
-            {option}`services.deezns.dns.listen` and is made the first
-            nameserver, so every resolver on the machine, glibc or not, goes
-            through the policy.  Callers are identified from their sockets:
-            uid always, gid and pid with
-            {option}`services.deezns.dns.identifyProcesses`.
-
-            Enabled on its own, nsncd stops handling host lookups so that
-            glibc resolves in-process and its queries, too, come from the
-            caller's own socket.  With the nscd front-end or the NSS module
-            enabled as well, nsncd keeps handling them (it has to, for those
-            front-ends to see glibc's lookups), glibc's lookups are judged
-            there, and nsncd's own DNS queries are forwarded unjudged.
-          '';
-        };
-
-        listen = lib.mkOption {
-          type = lib.types.str;
-          default = "127.0.0.1:53";
-          description = ''
-            Address and port the daemon serves DNS on, over UDP and TCP, when
-            {option}`services.deezns.dns.enable` is set.  glibc only ever
-            queries port 53; the daemon is granted `CAP_NET_BIND_SERVICE`
-            for it.  The address is put first in `networking.nameservers`.
-          '';
-        };
-
-        upstream = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          example = "192.0.2.53:53";
-          description = ''
-            The real DNS server, as `address:port`, that answers the queries
-            the policy lets through.  Required when
-            {option}`services.deezns.dns.enable` is set.
-          '';
-        };
-
-        identifyProcesses = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-          description = ''
-            Grant the daemon `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE` so it
-            can find the process behind a query in `/proc/<pid>/fd`, giving
-            rules `gid` and `pid` as well as `uid`.  Off by default because
-            `CAP_DAC_READ_SEARCH` lets the daemon read any file its sandbox
-            exposes, `/etc/shadow` included; the socket tables give the uid
-            regardless, and `gid` and `pid` are then `-1`.
-          '';
-        };
-      };
-
-      nss = {
-        enable = lib.mkOption {
-          type = lib.types.bool;
-          default = false;
-          description = ''
-            The NSS module: `libnss_deezns.so.2` is added to the `hosts`
-            line of `/etc/nsswitch.conf`.  Because NixOS runs NSS modules
-            inside nsncd, the daemon then sees nsncd's uid, gid and pid for
-            every lookup made through glibc; only clients of the daemon's own
-            socket are identified individually.
-
-            With the nscd front-end enabled as well, the lookups reaching
-            the NSS module have been judged there already and pass through
-            it unjudged.  With the DNS front-end enabled as well, nsncd's
-            DNS queries have been judged by the NSS module and pass through
-            the DNS front-end unjudged.
-          '';
-        };
-
-        order = lib.mkOption {
-          type = lib.types.int;
-          default =
-            if config.services.resolved.enable
-            then 500
-            else 1000;
-          defaultText = lib.literalExpression "if config.services.resolved.enable then 500 else 1000";
-          description = ''
-            With {option}`services.deezns.nss.enable` set: the position of
-            `deezns` in the `hosts` line of `/etc/nsswitch.conf`, as a
-            `lib.mkOrder` priority.  NixOS places `mymachines` at 400,
-            `resolve` at 501, `files` at 998, `myhostname` at 999 and `dns`
-            at 1499.
-
-            The default puts deezns after `files` (so `/etc/hosts` entries
-            are never subject to policy) and before `dns`.  With
-            systemd-resolved enabled, `resolve` answers before `files` and
-            stops the lookup, so deezns is moved ahead of it; names from
-            `/etc/hosts` are then evaluated against the policy too.  With
-            the DNS front-end but not the nscd front-end enabled, it must
-            stay before `dns`.
-          '';
-        };
+          The default puts deezns after `files` (so `/etc/hosts` entries are
+          never subject to policy) and before `dns`.  With systemd-resolved
+          enabled, `resolve` answers before `files` and stops the lookup, so
+          deezns is moved ahead of it; names from `/etc/hosts` are then
+          evaluated against the policy too.  With the DNS front-end but not
+          the nscd front-end enabled, it must stay before `dns`.
+        '';
       };
 
       settings = lib.mkOption {
@@ -370,78 +229,138 @@ moduleWithSystem (
               });
             };
 
-            policy_socket = lib.mkOption {
+            nscd_user = lib.mkOption {
+              type = lib.types.str;
+              default = config.services.nscd.user;
+              defaultText = lib.literalExpression "config.services.nscd.user";
+              description = ''
+                The user nscd (nsncd) runs as.  The lookups it makes for a
+                front-end in front of it have been judged already, so the
+                daemon passes them through: on the policy socket when the nscd
+                front-end is enabled, on the DNS front-end when the nscd
+                front-end or the NSS module is.
+              '';
+            };
+
+            nscd_frontend = lib.mkOption {
               default = {};
               description = ''
-                Settings of the daemon's own socket, the one the NSS module
-                and direct clients use.  Set by the module.
+                The nscd front-end: the daemon listens on nscd's socket in
+                place of nsncd, which is moved behind it.  Host lookups are
+                judged with the credentials of the process that asked; all
+                other requests are forwarded to nsncd unchanged.  Requires
+                nsncd ({option}`services.nscd.enableNsncd`).
               '';
               type = lib.types.submodule {
                 freeformType = settingsFormat.type;
-                options.relay_users = lib.mkOption {
-                  type = lib.types.listOf lib.types.str;
-                  default = [];
-                  description = ''
-                    Users whose lookups pass through without evaluating the
-                    rules, because another front-end has judged them.  The
-                    module puts nsncd's user here when the nscd front-end is
-                    enabled.
-                  '';
+                options = {
+                  enable = lib.mkOption {
+                    type = lib.types.bool;
+                    default = true;
+                    description = "Whether to enable the nscd front-end.";
+                  };
+                  listen = lib.mkOption {
+                    type = lib.types.path;
+                    default = "/run/nscd/socket";
+                    description = ''
+                      The socket glibc's nscd client connects to.  glibc has
+                      this path compiled in (`/var/run/nscd/socket`, and
+                      `/var/run` is `/run`), so there is normally no reason to
+                      change it.
+                    '';
+                  };
+                  upstream = lib.mkOption {
+                    type = lib.types.path;
+                    default = "/run/nsncd/socket";
+                    description = ''
+                      Where nsncd listens instead, and where the daemon
+                      forwards the requests it does not answer itself.  Set on
+                      `nscd.service` as `NSNCD_SOCKET_PATH`; must be under
+                      `/run` and differ from both `listen` and
+                      {option}`services.deezns.socketPath`.
+                    '';
+                  };
                 };
               };
             };
 
             dns_frontend = lib.mkOption {
-              default = null;
+              default = {};
               description = ''
-                The daemon's DNS front-end.  Set by the module from
-                {option}`services.deezns.dns` when
-                {option}`services.deezns.dns.enable` is set.
+                The DNS front-end: the daemon serves DNS on `listen` and is
+                made the first nameserver, so every resolver on the machine,
+                glibc or not, goes through the policy.  Callers are
+                identified from their sockets.
+
+                Enabled on its own, nsncd stops handling host lookups so that
+                glibc resolves in-process and its queries, too, come from the
+                caller's own socket.  With the nscd front-end or the NSS
+                module enabled as well, nsncd keeps handling them and
+                glibc's lookups are judged there.
               '';
-              type = lib.types.nullOr (lib.types.submodule {
+              type = lib.types.submodule {
                 freeformType = settingsFormat.type;
                 options = {
+                  enable = lib.mkOption {
+                    type = lib.types.bool;
+                    default = false;
+                    description = "Whether to enable the DNS front-end.";
+                  };
                   listen = lib.mkOption {
                     type = lib.types.str;
-                    description = "Address and port to serve DNS on.";
+                    default = "127.0.0.1:53";
+                    description = ''
+                      Address and port to serve DNS on, over UDP and TCP.
+                      glibc only ever queries port 53; the daemon is granted
+                      `CAP_NET_BIND_SERVICE` for it.  The address is put first
+                      in `networking.nameservers`.
+                    '';
                   };
                   upstream = lib.mkOption {
-                    type = lib.types.str;
-                    description = "The DNS server that answers what deezns does not.";
-                  };
-                  relay_users = lib.mkOption {
-                    type = lib.types.listOf lib.types.str;
-                    default = [];
+                    type = lib.types.nullOr lib.types.str;
+                    default = null;
+                    example = "192.0.2.53:53";
                     description = ''
-                      Users whose queries are forwarded without evaluating the
-                      rules, because another front-end has judged them.  The
-                      module puts nsncd's user here when the nscd front-end or
-                      the NSS module is enabled.
+                      The real DNS server, as `address:port`, that answers the
+                      queries the policy lets through.  Required when the
+                      front-end is enabled.
+                    '';
+                  };
+                  identify_processes = lib.mkOption {
+                    type = lib.types.bool;
+                    default = false;
+                    description = ''
+                      Find the process behind a query in `/proc/<pid>/fd`,
+                      giving rules `gid` and `pid` as well as `uid`; the unit
+                      is granted `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`
+                      for it.  Off by default because `CAP_DAC_READ_SEARCH`
+                      lets the daemon read any file its sandbox exposes,
+                      `/etc/shadow` included; the socket tables give the uid
+                      regardless, and `gid` and `pid` are then `-1`.
                     '';
                   };
                 };
-              });
+              };
             };
 
-            nscd_frontend = lib.mkOption {
-              default = null;
+            nss_frontend = lib.mkOption {
+              default = {};
               description = ''
-                The daemon's nscd-protocol front-end.  Set by the module from
-                {option}`services.deezns.nscd` when
-                {option}`services.deezns.nscd.enable` is set.
+                The NSS module: `libnss_deezns.so.2` is added to the `hosts`
+                line of `/etc/nsswitch.conf` at
+                {option}`services.deezns.nssOrder`.  Because NixOS runs NSS
+                modules inside nsncd, the daemon then sees nsncd's uid, gid
+                and pid for every lookup made through glibc; only clients of
+                the daemon's own socket are identified individually.
               '';
-              type = lib.types.nullOr (lib.types.submodule {
-                options = {
-                  listen = lib.mkOption {
-                    type = lib.types.path;
-                    description = "The socket glibc's nscd client connects to.";
-                  };
-                  upstream = lib.mkOption {
-                    type = lib.types.path;
-                    description = "The real nscd that answers what deezns does not.";
-                  };
+              type = lib.types.submodule {
+                freeformType = settingsFormat.type;
+                options.enable = lib.mkOption {
+                  type = lib.types.bool;
+                  default = false;
+                  description = "Whether to enable the NSS module.";
                 };
-              });
+              };
             };
           };
         };
@@ -571,28 +490,28 @@ moduleWithSystem (
           {
             assertion = config.services.nscd.enableNsncd;
             message = ''
-              services.deezns.nscd.enable needs nsncd
+              services.deezns.settings.nscd_frontend needs nsncd
               (services.nscd.enableNsncd): glibc's own nscd has its socket
               path compiled in and cannot be moved behind deezns.
             '';
           }
           {
-            assertion = lib.hasPrefix "/run/" cfg.nscd.socketPath && lib.hasPrefix "/run/" cfg.nscd.nsncdSocketPath;
+            assertion = lib.hasPrefix "/run/" nscd_frontend.listen && lib.hasPrefix "/run/" nscd_frontend.upstream;
             message = ''
-              services.deezns.nscd.socketPath and nsncdSocketPath must be
-              under /run, where the services' RuntimeDirectories are created.
+              services.deezns.settings.nscd_frontend.listen and upstream must
+              be under /run, where the services' RuntimeDirectories are created.
             '';
           }
           {
-            assertion = lib.length (lib.unique [cfg.socketPath cfg.nscd.socketPath cfg.nscd.nsncdSocketPath]) == 3;
+            assertion = lib.length (lib.unique [cfg.socketPath nscd_frontend.listen nscd_frontend.upstream]) == 3;
             message = ''
               services.deezns: the daemon's policy socket (${cfg.socketPath}),
-              its nscd socket (${cfg.nscd.socketPath}) and nsncd's socket
-              (${cfg.nscd.nsncdSocketPath}) must be three different paths.
+              its nscd socket (${nscd_frontend.listen}) and nsncd's socket
+              (${nscd_frontend.upstream}) must be three different paths.
             '';
           }
           {
-            assertion = effectiveNsncdSocket != cfg.nscd.socketPath && effectiveNsncdSocket != cfg.socketPath;
+            assertion = effectiveNsncdSocket != nscd_frontend.listen && effectiveNsncdSocket != cfg.socketPath;
             message = ''
               services.deezns: nscd.service's NSNCD_SOCKET_PATH
               (${toString effectiveNsncdSocket}) is one of the daemon's own
@@ -600,75 +519,66 @@ moduleWithSystem (
             '';
           }
           {
-            assertion = effectiveNsncdSocket == cfg.nscd.nsncdSocketPath;
+            assertion = effectiveNsncdSocket == nscd_frontend.upstream;
             message = ''
               services.deezns: nscd.service's NSNCD_SOCKET_PATH
               (${toString effectiveNsncdSocket}) differs from
-              services.deezns.nscd.nsncdSocketPath (${cfg.nscd.nsncdSocketPath}),
-              where the daemon forwards requests.  Set the deezns option
-              rather than the environment variable.
+              services.deezns.settings.nscd_frontend.upstream
+              (${nscd_frontend.upstream}), where the daemon forwards requests.
+              Set the deezns setting rather than the environment variable.
             '';
           }
         ];
 
-        services.deezns.settings = {
-          nscd_frontend = {
-            listen = cfg.nscd.socketPath;
-            upstream = cfg.nscd.nsncdSocketPath;
-          };
-          # The host lookups nsncd makes through the NSS module are the ones
-          # the nscd front-end let through.
-          policy_socket.relay_users = [nsncdUser];
-        };
-
         # nsncd moves out of the way; its runtime directory follows its
         # socket so the two services never share one.
         systemd.services.nscd = {
-          environment.NSNCD_SOCKET_PATH = cfg.nscd.nsncdSocketPath;
-          serviceConfig.RuntimeDirectory = lib.mkForce (runtimeDirectoryOf cfg.nscd.nsncdSocketPath);
+          environment.NSNCD_SOCKET_PATH = nscd_frontend.upstream;
+          serviceConfig.RuntimeDirectory = lib.mkForce (runtimeDirectoryOf nscd_frontend.upstream);
         };
 
-        systemd.services.deezns.serviceConfig.RuntimeDirectory = [(runtimeDirectoryOf cfg.nscd.socketPath)];
+        systemd.services.deezns.serviceConfig.RuntimeDirectory = [(runtimeDirectoryOf nscd_frontend.listen)];
       })
 
       # ── DNS front-end ─────────────────────────────────────────────────
       (lib.mkIf dnsFrontend {
         assertions = [
           {
-            assertion = cfg.dns.upstream != null;
+            assertion = dns_frontend.upstream != null;
             message = ''
-              services.deezns.dns.enable needs services.deezns.dns.upstream,
-              the DNS server that answers the queries the policy lets through.
+              services.deezns.settings.dns_frontend needs an upstream, the DNS
+              server that answers the queries the policy lets through.
             '';
           }
           {
             assertion = listenAddress != null;
             message = ''
-              services.deezns.dns.listen (${cfg.dns.listen}) must be "address:port".
+              services.deezns.settings.dns_frontend.listen (${dns_frontend.listen})
+              must be "address:port".
             '';
           }
           {
             assertion = config.services.nscd.enableNsncd;
             message = ''
-              services.deezns.dns.enable needs nsncd
+              services.deezns.settings.dns_frontend needs nsncd
               (services.nscd.enableNsncd), which can be told to leave host
               lookups to glibc with NSNCD_IGNORE_HOSTS.
             '';
           }
           {
-            assertion = nssFrontend && !nscdFrontend -> cfg.nss.order < dnsNssOrder;
+            assertion = nssFrontend && !nscdFrontend -> cfg.nssOrder < dnsNssOrder;
             message = ''
-              services.deezns.nss.order (${toString cfg.nss.order}) must be
-              below ${toString dnsNssOrder}, before `dns` in nsswitch.conf,
-              when the NSS module and the DNS front-end are enabled without
-              the nscd front-end: the DNS front-end then forwards nsncd's
-              queries unjudged, trusting the NSS module to have judged them.
+              services.deezns.nssOrder (${toString cfg.nssOrder}) must be below
+              ${toString dnsNssOrder}, before `dns` in nsswitch.conf, when the
+              NSS module and the DNS front-end are enabled without the nscd
+              front-end: the DNS front-end then passes nsncd's queries through,
+              trusting the NSS module to have judged them.
             '';
           }
           {
             assertion = !config.services.resolved.enable;
             message = ''
-              services.deezns.dns.enable does not work with
+              services.deezns.settings.dns_frontend does not work with
               systemd-resolved (services.resolved.enable): its stub resolver
               would sit between the applications and the daemon, so every
               query would identify systemd-resolved rather than the program
@@ -676,14 +586,6 @@ moduleWithSystem (
             '';
           }
         ];
-
-        services.deezns.settings.dns_frontend = {
-          listen = cfg.dns.listen;
-          upstream = cfg.dns.upstream;
-          # nsncd's DNS queries come after the nscd front-end or the NSS
-          # module has judged the lookup.
-          relay_users = lib.optional (nscdFrontend || nssFrontend) nsncdUser;
-        };
 
         # Alone, nsncd answers nothing for host lookups, so glibc performs
         # them in each process itself, through resolv.conf, and the DNS
@@ -704,7 +606,7 @@ moduleWithSystem (
       (lib.mkIf nssFrontend {
         # nscd performs every host lookup on the system's behalf (see the top
         # of this file), so it is the one client that must reach the socket.
-        users.users.${nsncdUser}.extraGroups = ["deezns"];
+        users.users.${config.services.nscd.user}.extraGroups = ["deezns"];
 
         system.nssModules = [cfg.package];
         # `[!UNAVAIL=return]`: glibc's default actions are SUCCESS=return and
@@ -714,7 +616,7 @@ moduleWithSystem (
         # daemon that is not running, returns UNAVAIL and the next source is
         # tried.
         # https://www.gnu.org/software/libc/manual/html_node/Actions-in-the-NSS-configuration.html
-        system.nssDatabases.hosts = lib.mkOrder cfg.nss.order ["deezns [!UNAVAIL=return]"];
+        system.nssDatabases.hosts = lib.mkOrder cfg.nssOrder ["deezns [!UNAVAIL=return]"];
       })
     ]);
   }

@@ -55,12 +55,14 @@
   }: {
     services.deezns = {
       enable = true;
-      nscd.enable = nscd;
-      dns = {
-        enable = dns;
-        upstream = "192.0.2.53:53";
+      settings = {
+        nscd_frontend.enable = nscd;
+        dns_frontend = {
+          enable = dns;
+          upstream = "192.0.2.53:53";
+        };
+        nss_frontend.enable = nss;
       };
-      nss.enable = nss;
     };
   };
 
@@ -81,11 +83,12 @@
     else "front-ends: ${lib.concatStringsSep " + " names}";
 
   ignoresHosts = config: config.systemd.services.nscd.environment ? NSNCD_IGNORE_HOSTS;
+  capabilities = config: config.systemd.services.deezns.serviceConfig.AmbientCapabilities;
 
   results =
     [
       (accepts "nscd front-end with defaults" [{services.deezns.enable = true;}])
-      (accepts "dns front-end identifying processes" [dns {services.deezns.dns.identifyProcesses = true;}])
+      (accepts "dns front-end identifying processes" [dns {services.deezns.settings.dns_frontend.identify_processes = true;}])
       (accepts "no front-end and no nscd" [
         (frontends {})
         {
@@ -99,11 +102,22 @@
           dns = true;
           nss = true;
         })
-        {services.deezns.nss.order = 1600;}
+        {services.deezns.nssOrder = 1600;}
       ])
     ]
     ++ map (enabled: accepts (describe enabled) [(frontends enabled)]) combinations
     ++ [
+      (yields "only the nscd front-end is on by default" (
+          c: let
+            s = c.services.deezns.settings;
+          in
+            s.nscd_frontend.enable && !s.dns_frontend.enable && !s.nss_frontend.enable
+        ) [
+          {services.deezns.enable = true;}
+        ])
+      (yields "the daemon knows nsncd's user" (c: c.services.deezns.settings.nscd_user == c.services.nscd.user) [
+        {services.deezns.enable = true;}
+      ])
       (yields "the DNS front-end alone leaves host lookups to glibc" ignoresHosts [dns])
       (yields "the DNS front-end with the nscd front-end keeps nsncd resolving hosts" (c: !ignoresHosts c) [
         (frontends {
@@ -117,37 +131,11 @@
           nss = true;
         })
       ])
-      (yields "the DNS front-end alone relays nobody" (c: c.services.deezns.settings.dns_frontend.relay_users == []) [dns])
-      (yields "behind the nscd front-end, nsncd is a relay on both other listeners" (
-          c:
-            c.services.deezns.settings.dns_frontend.relay_users
-            == ["nscd"]
-            && c.services.deezns.settings.policy_socket.relay_users == ["nscd"]
-        ) [
-          (frontends {
-            nscd = true;
-            dns = true;
-            nss = true;
-          })
-        ])
-      (yields "behind the NSS module alone, nsncd is a relay on the DNS front-end only" (
-          c:
-            c.services.deezns.settings.dns_frontend.relay_users
-            == ["nscd"]
-            && c.services.deezns.settings.policy_socket.relay_users == []
-        ) [
-          (frontends {
-            dns = true;
-            nss = true;
-          })
-        ])
-      (yields "nssOrder is renamed to nss.order" (c: c.services.deezns.nss.order == 1200) [
-        (frontends {nss = true;})
-        {services.deezns.nssOrder = 1200;}
+      (yields "identify_processes grants the capabilities it needs" (c: lib.hasInfix "CAP_SYS_PTRACE" (capabilities c)) [
+        dns
+        {services.deezns.settings.dns_frontend.identify_processes = true;}
       ])
-      (yields "the nscd front-end is on by default" (c: c.services.deezns.nscd.enable && !c.services.deezns.dns.enable && !c.services.deezns.nss.enable) [
-        {services.deezns.enable = true;}
-      ])
+      (yields "without identify_processes the daemon keeps only CAP_NET_BIND_SERVICE" (c: capabilities c == "CAP_NET_BIND_SERVICE") [dns])
 
       (refuses "nsncd's socket forced onto the daemon's nscd socket" "fight over it" [
         {
@@ -171,7 +159,7 @@
         {
           services.deezns = {
             enable = true;
-            nscd.nsncdSocketPath = "/run/nscd/socket";
+            settings.nscd_frontend.upstream = "/run/nscd/socket";
           };
         }
       ])
@@ -179,7 +167,7 @@
         {
           services.deezns = {
             enable = true;
-            nscd.nsncdSocketPath = "/var/run/nsncd/socket";
+            settings.nscd_frontend.upstream = "/var/run/nsncd/socket";
           };
         }
       ])
@@ -196,11 +184,11 @@
           system.nssModules = lib.mkForce [];
         }
       ])
-      (refuses "dns front-end without an upstream" "dns.upstream" [
+      (refuses "dns front-end without an upstream" "needs an upstream" [
         {
           services.deezns = {
             enable = true;
-            dns.enable = true;
+            settings.dns_frontend.enable = true;
           };
         }
       ])
@@ -208,22 +196,14 @@
         dns
         {services.nscd.enableNsncd = false;}
       ])
-      (refuses "NSS module after dns in front of the DNS front-end" "must be" [
+      (refuses "NSS module after dns in front of the DNS front-end" "must be below" [
         (frontends {
           dns = true;
           nss = true;
         })
-        {services.deezns.nss.order = 1600;}
+        {services.deezns.nssOrder = 1600;}
       ])
-      (refuses "the removed frontend option" "no longer has any effect" [
-        {
-          services.deezns = {
-            enable = true;
-            frontend = "dns";
-          };
-        }
-      ])
-      (refuses "dns front-end with a malformed listen address" "address:port" [dns {services.deezns.dns.listen = "nonsense";}])
+      (refuses "dns front-end with a malformed listen address" "address:port" [dns {services.deezns.settings.dns_frontend.listen = "nonsense";}])
       (refuses "dns front-end with systemd-resolved" "systemd-resolved" [dns {services.resolved.enable = true;}])
     ];
 in

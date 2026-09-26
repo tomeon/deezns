@@ -46,13 +46,15 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     project grows a real need for a pinned or nightly toolchain.
 - `nixosModules.deezns` (also `nixosModules.default`) is
   `nix/modules/nixos/deezns.nix`:
-  `services.deezns.{enable,package,settings}`, the front-end toggles
-  `services.deezns.{nscd,dns,nss}.enable`, plus a read-only `socketPath`
-  taken from the package's `passthru.socketPath`. The daemon runs as user
-  `deezns` under a hardened systemd unit. The front-ends decide how
-  glibc's lookups reach it; any combination may be enabled (the old
-  `frontend` enum is a removed option, `nssOrder` renamed to `nss.order`):
-  - `nscd` (on by default): the daemon answers on `/run/nscd/socket` in
+  `services.deezns.{enable,package,nssOrder,settings}` plus a read-only
+  `socketPath` taken from the package's `passthru.socketPath`. The
+  daemon runs as user `deezns` under a hardened systemd unit.
+  `services.deezns.settings` is the daemon's TOML policy and the only
+  place its behaviour is configured, front-ends included; the module
+  derives the system configuration (nsncd's environment, nsswitch.conf,
+  nameservers, capabilities) from it. Each front-end is a section with
+  a native `enable`, and any combination may be enabled:
+  - `nscd_frontend` (enabled by default): the daemon answers on `/run/nscd/socket` in
     nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
     moved to `/run/nsncd/socket` via `NSNCD_SOCKET_PATH`, with its
     RuntimeDirectory forced to match. Host lookups are judged with the
@@ -62,13 +64,14 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     `NSNCD_SOCKET_PATH`. A denial must be answered as `found=0` with
     `HOST_NOT_FOUND`: `found=-1` or a closed connection makes glibc
     bypass nscd for its next hundred lookups.
-  - `dns`: the daemon serves DNS on `services.deezns.dns.listen`
-    (`src/dns.rs`, UDP and TCP, forwarding to `dns.upstream`), is put
+  - `dns_frontend`: the daemon serves DNS on `listen`
+    (`src/dns.rs`, UDP and TCP, forwarding to `upstream`), is put
     first in `networking.nameservers`, and, when it is the only
     front-end, nscd.service gets `NSNCD_IGNORE_HOSTS=true` so glibc
     resolves in-process and the query leaves the caller's own socket. `src/identify.rs` reads the caller's
     uid from `/proc/net/{udp,udp6,tcp,tcp6}`; with
-    `dns.identifyProcesses` (off by default) the unit gets
+    `identify_processes` (off by default) the daemon looks for the
+    process and the unit gets
     `CAP_DAC_READ_SEARCH` (to list another user's 0500 `/proc/<pid>/fd`)
     and `CAP_SYS_PTRACE` (to follow its links) and the pid and gid are
     found via `/proc/<pid>/fd` and status, otherwise rules see
@@ -84,8 +87,8 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     their work (512 connections, 5 s deadlines) and the nscd front-end
     validates the real nscd's host replies before relaying them, since
     an empty or `found=-1` reply makes glibc bypass nscd.
-  - `nss`: the package goes into `system.nssModules` and
-    `deezns [!UNAVAIL=return]` into the `hosts` line at `nss.order`.
+  - `nss_frontend`: the package goes into `system.nssModules` and
+    `deezns [!UNAVAIL=return]` into the `hosts` line at `nssOrder`.
     NixOS loads third-party NSS modules only inside nsncd, so the
     daemon then sees nsncd's uid, gid and pid for every lookup made
     through glibc; the nscd user joins group `deezns` to reach the 0660
@@ -95,12 +98,12 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   - Combined, a lookup is judged once, by the first front-end it meets
     (nscd front-end, then nsncd's NSS module, then `dns` and the DNS
     front-end). nsncd keeps resolving hosts whenever the nscd front-end
-    or the NSS module is on, and its user is set as a relay
-    (`src/relay.rs`, the daemon's `relay_users`) on the policy socket
-    behind the nscd front-end and on the DNS front-end behind either,
-    so its lookups pass through unjudged instead of being judged as
-    nsncd's. With the NSS module and the DNS front-end but no nscd
-    front-end, `nss.order` must stay below `dns`'s 1499.
+    or the NSS module is on, and the daemon (`src/relay.rs`) passes the
+    lookups of `nscd_user` (default `services.nscd.user`) through
+    unjudged on the policy socket behind the nscd front-end and on the
+    DNS front-end behind either, instead of judging them as nsncd's.
+    With the NSS module and the DNS front-end but no nscd front-end,
+    `nssOrder` must stay below `dns`'s 1499.
 - `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, an
   earlier prototype for the same problem: nsncd records each client's
   `SO_PEERCRED` in a thread-local while handling its request and
@@ -113,8 +116,8 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   module against configurations that must be accepted or refused (every
   combination of front-ends, socket-path collisions, glibc's nscd, a
   missing DNS upstream, systemd-resolved with the dns front-end, the NSS
-  module after `dns`) or must yield particular settings (relays,
-  `NSNCD_IGNORE_HOSTS`), and fails the evaluation otherwise. Add a case
+  module after `dns`) or must yield particular settings (defaults,
+  `NSNCD_IGNORE_HOSTS`, capabilities), and fails the evaluation otherwise. Add a case
   there whenever the module gains an assertion.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.

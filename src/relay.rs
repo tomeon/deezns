@@ -1,18 +1,27 @@
 //! Relays: users whose lookups a listener passes through unjudged.
 //!
-//! When front-ends are stacked, one lookup can reach the daemon twice.  With
-//! the nscd front-end in place, glibc's host lookups are judged there, with
-//! the caller's own credentials, and the ones the policy lets through are
-//! forwarded to nsncd, which resolves them through its NSS modules: the
-//! deezns NSS module (the policy socket) and `dns` (possibly the DNS
-//! front-end).  Judging them again there would see nsncd's credentials and
-//! undo per-user rules, so nsncd's user is configured as a relay for those
-//! listeners and its lookups are passed through.
+//! When front-ends are stacked, one lookup can reach the daemon more than
+//! once, in this order:
 //!
-//! Users are named in the configuration and resolved to uids once, at
-//! startup; a name that does not resolve is a configuration error.
+//! ```text
+//! glibc -> [nscd front-end] -> nscd -> [NSS module] -> dns -> [DNS front-end]
+//! ```
+//!
+//! The nscd front-end judges glibc's host lookups with the caller's own
+//! credentials and forwards the ones the policy lets through to nscd, which
+//! resolves them through its NSS modules: the deezns NSS module (the policy
+//! socket) and `dns` (possibly the DNS front-end).  Judging them again there
+//! would see nscd's credentials and undo per-user rules.  So nscd's user
+//! (`nscd_user`) is a relay on the policy socket when the nscd front-end is
+//! enabled, and on the DNS front-end when the nscd front-end or the NSS
+//! module is (the NSS module comes before `dns`); its lookups there pass
+//! through.  Programs with their own DNS client still meet the DNS
+//! front-end first.
+//!
+//! The user is resolved to a uid once, at startup; a name that does not
+//! resolve is a configuration error.
 
-use crate::policy::Caller;
+use crate::policy::{Caller, PolicyConfig};
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -51,6 +60,34 @@ impl Relays {
     /// never is.
     pub fn contains(&self, caller: &Caller) -> bool {
         caller.uid.is_some_and(|uid| self.uids.contains(&uid))
+    }
+}
+
+/// The relays of the listeners that can sit behind another front-end.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ListenerRelays {
+    pub policy_socket: Relays,
+    pub dns: Relays,
+}
+
+/// Whether nscd is a relay on the policy socket and on the DNS front-end.
+fn relaying(cfg: &PolicyConfig) -> (bool, bool) {
+    let nscd = cfg.nscd().is_some();
+    (nscd, nscd || cfg.nss())
+}
+
+impl ListenerRelays {
+    pub fn for_config(cfg: &PolicyConfig) -> io::Result<Self> {
+        let (policy_socket, dns) = relaying(cfg);
+        let nscd = match &cfg.nscd_user {
+            Some(user) if policy_socket || dns => Relays::resolve(std::slice::from_ref(user))?,
+            _ => Relays::default(),
+        };
+        let only_if = |on: bool| if on { nscd.clone() } else { Relays::default() };
+        Ok(ListenerRelays {
+            policy_socket: only_if(policy_socket),
+            dns: only_if(dns),
+        })
     }
 }
 
@@ -122,6 +159,50 @@ mod tests {
     fn unknown_users_are_an_error() {
         let err = Relays::resolve(&["deezns-no-such-user".to_string()]).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    fn config(toml: &str) -> PolicyConfig {
+        toml::from_str(toml).unwrap()
+    }
+
+    const NSCD: &str = "[nscd_frontend]\nlisten = \"/a\"\nupstream = \"/b\"\n";
+    const NSS: &str = "[nss_frontend]\n";
+
+    #[test]
+    fn nscd_relays_behind_the_front_ends_before_it() {
+        assert_eq!(relaying(&config("")), (false, false));
+        assert_eq!(relaying(&config(NSS)), (false, true));
+        assert_eq!(relaying(&config(NSCD)), (true, true));
+        assert_eq!(relaying(&config(&format!("{NSCD}{NSS}"))), (true, true));
+        let disabled = format!("{NSCD}enable = false\n{NSS}enable = false\n");
+        assert_eq!(relaying(&config(&disabled)), (false, false));
+    }
+
+    #[test]
+    fn nscd_user_is_resolved_for_the_listeners_that_relay() {
+        let me = Caller::new(unsafe { libc::geteuid() }, 0, 1);
+        let user = format!("nscd_user = {:?}\n", current_user());
+
+        let relays = ListenerRelays::for_config(&config(&format!("{user}{NSS}"))).unwrap();
+        assert!(!relays.policy_socket.contains(&me));
+        assert!(relays.dns.contains(&me));
+
+        let relays = ListenerRelays::for_config(&config(&format!("{user}{NSCD}"))).unwrap();
+        assert!(relays.policy_socket.contains(&me));
+        assert!(relays.dns.contains(&me));
+
+        // No front-end in front of anything: the user is not even looked up.
+        let nobody = "nscd_user = \"deezns-no-such-user\"\n";
+        assert_eq!(
+            ListenerRelays::for_config(&config(nobody)).unwrap(),
+            ListenerRelays::default()
+        );
+        assert!(ListenerRelays::for_config(&config(&format!("{nobody}{NSS}"))).is_err());
+        // Without nscd_user nobody relays.
+        assert_eq!(
+            ListenerRelays::for_config(&config(NSCD)).unwrap(),
+            ListenerRelays::default()
+        );
     }
 
     #[test]

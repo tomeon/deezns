@@ -13,7 +13,7 @@ mod upstream;
 use peercred::peer_caller;
 use policy::{PolicyConfig, PolicyEngine, PolicyVerdict};
 use protocol::{ResolveRequest, ResolveResponse, SOCKET_PATH};
-use relay::Relays;
+use relay::{ListenerRelays, Relays};
 use upstream::upstream_resolve;
 
 use std::io;
@@ -176,19 +176,15 @@ async fn main() -> io::Result<()> {
     let config = PolicyConfig::from_path(&config_path).map_err(invalid)?;
     let engine = Arc::new(PolicyEngine::from_config(&config).map_err(invalid)?);
 
-    // Relay users are resolved before any socket is bound: with the nscd
+    // nscd's user is resolved before any socket is bound: with the nscd
     // front-end, glibc would otherwise ask this very daemon, which is not
     // serving yet.
-    let socket_relays = Relays::resolve(&config.policy_socket.relay_users)?;
-    let dns_relays = match &config.dns_frontend {
-        Some(front_cfg) => Relays::resolve(&front_cfg.relay_users)?,
-        None => Relays::default(),
-    };
+    let relays = ListenerRelays::for_config(&config)?;
 
     // Bind everything before serving anything, so a bad configuration fails
     // the whole daemon instead of half of it.
     let policy_listener = bind_policy_socket()?;
-    let nscd_front = match &config.nscd_frontend {
+    let nscd_front = match config.nscd() {
         Some(front_cfg) => {
             let front = Arc::new(nscd::Frontend::new(front_cfg, Arc::clone(&engine)));
             let listener = front.bind()?;
@@ -202,16 +198,15 @@ async fn main() -> io::Result<()> {
         None => None,
     };
 
-    let dns_front = match &config.dns_frontend {
+    let dns_front = match config.dns() {
         Some(front_cfg) => {
             let front = Arc::new(
-                dns::Frontend::new(front_cfg, Arc::clone(&engine)).with_relays(dns_relays),
+                dns::Frontend::new(front_cfg, Arc::clone(&engine))?.with_relays(relays.dns),
             );
             let (udp, tcp) = front.bind().await?;
             info!(
                 address = %front.listen_addr(),
-                upstream = %front_cfg.upstream,
-                relays = ?front_cfg.relay_users,
+                upstream = %front.upstream_addr(),
                 "listening (DNS front-end)"
             );
             Some((front, udp, tcp))
@@ -220,7 +215,11 @@ async fn main() -> io::Result<()> {
     };
 
     let mut tasks = JoinSet::new();
-    tasks.spawn(serve_policy_socket(policy_listener, engine, socket_relays));
+    tasks.spawn(serve_policy_socket(
+        policy_listener,
+        engine,
+        relays.policy_socket,
+    ));
     if let Some((front, listener)) = nscd_front {
         tasks.spawn(front.serve(listener));
     }

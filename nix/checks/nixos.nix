@@ -80,13 +80,14 @@ in {
 
       services.deezns = {
         enable = true;
-        nscd.enable = true;
-        dns = {
-          enable = true;
-          upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
-        };
-        nss.enable = true;
         settings = {
+          nscd_frontend.enable = true;
+          dns_frontend = {
+            enable = true;
+            upstream = "${nodes.resolver.networking.primaryIPAddress}:53";
+          };
+          nss_frontend.enable = true;
+
           default_verdict = "passthrough";
 
           blocklists = [
@@ -214,10 +215,10 @@ in {
       # verdict, and each front-end on its own.
       specialisation = let
         only = frontend: {
-          services.deezns = {
-            nscd.enable = lib.mkForce (frontend == "nscd");
-            dns.enable = lib.mkForce (frontend == "dns");
-            nss.enable = lib.mkForce (frontend == "nss");
+          services.deezns.settings = {
+            nscd_frontend.enable = lib.mkForce (frontend == "nscd");
+            dns_frontend.enable = lib.mkForce (frontend == "dns");
+            nss_frontend.enable = lib.mkForce (frontend == "nss");
           };
         };
       in {
@@ -226,7 +227,7 @@ in {
         dns.configuration = only "dns";
         dns-ptrace.configuration = lib.mkMerge [
           (only "dns")
-          {services.deezns.dns.identifyProcesses = true;}
+          {services.deezns.settings.dns_frontend.identify_processes = true;}
         ];
       };
 
@@ -611,7 +612,7 @@ in {
         assert nss("example.local") == ["10.0.0.1"]
         client.succeed("getent passwd dynuser")
 
-    with subtest("Without identifyProcesses the DNS front-end knows the caller's uid only"):
+    with subtest("Without identify_processes the DNS front-end knows the caller's uid only"):
         client.succeed(f"{daemon_log()} | grep 'identified by uid only'")
         assert nss_as("alice", "alice-only.test") == [records["alice-only.test"]]
         assert nss_as("carol", "alice-only.test") is None
@@ -631,7 +632,7 @@ in {
             f"{daemon_log()} | grep 'hostname=\"staff-only.test\"' | grep 'peer.uid=1001 ' | grep 'peer.gid=-1 peer.pid=-1 '"
         )
 
-    with subtest("With identifyProcesses it knows the caller's gid and pid too"):
+    with subtest("With identify_processes it knows the caller's gid and pid too"):
         client.succeed(f"{base_system}/specialisation/dns-ptrace/bin/switch-to-configuration test")
         client.wait_for_unit("deezns.service")
         client.wait_until_succeeds("dig +time=1 +tries=1 @127.0.0.1 allowed.test")
