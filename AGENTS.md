@@ -45,20 +45,18 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     Rust to keep in sync. Reach for rust-overlay or fenix only if the
     project grows a real need for a pinned or nightly toolchain.
 - `nixosModules.deezns` (also `nixosModules.default`) is
-  `nix/module.nix`: `services.deezns.{enable,package,frontend,settings}`
-  plus a read-only `socketPath` taken from the package's
-  `passthru.socketPath`. Daemon settings are declared once, as options
-  under `settings` (e.g. `settings.nscd_frontend.{listen,upstream}`,
-  `settings.dns_frontend.{listen,upstream}`), and the rest of the module
-  reads them from there; the module never assigns to `settings` itself.
-  Only the selected front-end's section is written to the policy file.
-  Top-level options are kept for what is not daemon configuration
-  (`frontend`, `dns.identifyProcesses`, `nssOrder`). The daemon runs as user `deezns` under a
-  hardened systemd unit. `frontend` picks how glibc's lookups reach it:
-  - `nscd` (default): the daemon answers on
-    `settings.nscd_frontend.listen` (`/run/nscd/socket`) in nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
-    moved to `settings.nscd_frontend.upstream` (`/run/nsncd/socket`) via
-    `NSNCD_SOCKET_PATH`, with its
+  `nix/modules/nixos/deezns.nix`:
+  `services.deezns.{enable,package,nssOrder,settings}` plus a read-only
+  `socketPath` taken from the package's `passthru.socketPath`. The
+  daemon runs as user `deezns` under a hardened systemd unit.
+  `services.deezns.settings` is the daemon's TOML policy and the only
+  place its behaviour is configured, front-ends included; the module
+  derives the system configuration (nsncd's environment, nsswitch.conf,
+  nameservers, capabilities) from it. Each front-end is a section with
+  a native `enable`, and any combination may be enabled:
+  - `nscd_frontend` (enabled by default): the daemon answers on `/run/nscd/socket` in
+    nscd's place (`src/nscd.rs`, glibc's nscd protocol) and nsncd is
+    moved to `/run/nsncd/socket` via `NSNCD_SOCKET_PATH`, with its
     RuntimeDirectory forced to match. Host lookups are judged with the
     real caller's `SO_PEERCRED`; every other request is forwarded to
     nsncd byte for byte. Assertions require nsncd, keep the three socket
@@ -66,13 +64,14 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     `NSNCD_SOCKET_PATH`. A denial must be answered as `found=0` with
     `HOST_NOT_FOUND`: `found=-1` or a closed connection makes glibc
     bypass nscd for its next hundred lookups.
-  - `dns`: the daemon serves DNS on `settings.dns_frontend.listen`
-    (`src/dns.rs`, UDP and TCP, forwarding to `settings.dns_frontend.upstream`), is put
-    first in `networking.nameservers`, and nscd.service gets
-    `NSNCD_IGNORE_HOSTS=true` so glibc resolves in-process and the query
-    leaves the caller's own socket. `src/identify.rs` reads the caller's
+  - `dns_frontend`: the daemon serves DNS on `listen`
+    (`src/dns.rs`, UDP and TCP, forwarding to `upstream`), is put
+    first in `networking.nameservers`, and, when it is the only
+    front-end, nscd.service gets `NSNCD_IGNORE_HOSTS=true` so glibc
+    resolves in-process and the query leaves the caller's own socket. `src/identify.rs` reads the caller's
     uid from `/proc/net/{udp,udp6,tcp,tcp6}`; with
-    `dns.identifyProcesses` (off by default) the unit gets
+    `identify_processes` (off by default) the daemon looks for the
+    process and the unit gets
     `CAP_DAC_READ_SEARCH` (to list another user's 0500 `/proc/<pid>/fd`)
     and `CAP_SYS_PTRACE` (to follow its links) and the pid and gid are
     found via `/proc/<pid>/fd` and status, otherwise rules see
@@ -88,7 +87,7 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     their work (512 connections, 5 s deadlines) and the nscd front-end
     validates the real nscd's host replies before relaying them, since
     an empty or `found=-1` reply makes glibc bypass nscd.
-  - `nss`: the package goes into `system.nssModules` and
+  - `nss_frontend`: the package goes into `system.nssModules` and
     `deezns [!UNAVAIL=return]` into the `hosts` line at `nssOrder`.
     NixOS loads third-party NSS modules only inside nsncd, so the
     daemon then sees nsncd's uid, gid and pid for every lookup made
@@ -96,6 +95,15 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     socket. `[!UNAVAIL=return]` makes every status except UNAVAIL
     final; glibc's default is `SUCCESS=return` and `continue` for the
     rest, so without it a denial would fall through to `dns`.
+  - Combined, a lookup is judged once, by the first front-end it meets
+    (nscd front-end, then nsncd's NSS module, then `dns` and the DNS
+    front-end). nsncd keeps resolving hosts whenever the nscd front-end
+    or the NSS module is on, and the daemon (`src/relay.rs`) passes the
+    lookups of `nscd_user` (default `services.nscd.user`) through
+    unjudged on the policy socket behind the nscd front-end and on the
+    DNS front-end behind either, instead of judging them as nsncd's.
+    With the NSS module and the DNS front-end but no nscd front-end,
+    `nssOrder` must stay below `dns`'s 1499.
 - `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, an
   earlier prototype for the same problem: nsncd records each client's
   `SO_PEERCRED` in a thread-local while handling its request and
@@ -104,20 +112,23 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
   the lookup. The nscd front-end made it unnecessary; it is kept as a
   reference. The patch is a git format-patch against nsncd v1.5.2 and
   carries its own unit tests, which `nix build .#nsncd` runs.
-- `checks.<system>.module-assertions` is `nix/module-tests.nix`: it
-  evaluates the module against configurations that must be accepted or
-  refused (socket-path collisions, glibc's nscd, a missing DNS upstream,
-  systemd-resolved with the dns front-end) and fails the evaluation
-  otherwise. Add a case there whenever the module gains an assertion.
+- `checks.<system>.module` is `nix/checks/module.nix`: it evaluates the
+  module against configurations that must be accepted or refused (every
+  combination of front-ends, socket-path collisions, glibc's nscd, a
+  missing DNS upstream, systemd-resolved with the dns front-end, the NSS
+  module after `dns`) or must yield particular settings (defaults,
+  `NSNCD_IGNORE_HOSTS`, capabilities), and fails the evaluation otherwise. Add a case
+  there whenever the module gains an assertion.
 - `checks.<system>.treefmt` comes from treefmt-nix; `nix flake check`
   also builds the packages and the devshell.
-- `checks.<system>.nixos-test` is `pkgs.testers.runNixOSTest ./nix/test.nix`:
-  a `resolver` VM running dnsmasq for a set of test names and a `client`
-  VM running the module. The script looks every name up both directly
+- `checks.<system>.nixos` is `nix/checks/nixos.nix`, a
+  `testers.runNixOSTest`: a `resolver` VM running dnsmasq for a set of
+  test names and a `client` VM running the module with all three
+  front-ends enabled. The script looks every name up both directly
   against the resolver (`dig`) and through glibc (`getent ahosts`, also
   as different users via `runuser`), and checks the daemon's verdicts
   over its socket. Specialisations switch the client to a default-deny
-  policy and to the other front-ends mid-test; they are reached through
+  policy and to each front-end on its own mid-test; they are reached through
   the base system's store path, since `/run/current-system` moves. See
   "NixOS test" below for running it in the sandbox.
 - The devshell (`nix develop`, `menu`) provides the Rust toolchain, the
@@ -170,12 +181,12 @@ feature explicitly makes Nix accept the derivation, and QEMU
 
 ```
 nix flake check -L --option system-features "nixos-test benchmark big-parallel kvm"
-nix build -L --option system-features "nixos-test benchmark big-parallel kvm" .#checks.x86_64-linux.nixos-test
+nix build -L --option system-features "nixos-test benchmark big-parallel kvm" .#checks.x86_64-linux.nixos
 ```
 
 Emulated, the two VMs take on the order of ten minutes; run it
 detached. The test can also be driven interactively with
-`nix build .#checks.x86_64-linux.nixos-test.driverInteractive` and
+`nix build .#checks.x86_64-linux.nixos.driverInteractive` and
 `result/bin/nixos-test-driver`. On a machine with KVM the plain
 commands work.
 

@@ -22,13 +22,22 @@ default_verdict = "deny"
 # ── DNS front-end (optional) ──────────────────────────────────────────
 # Serve DNS on loopback and point resolv.conf here; callers are
 # identified from their sockets (uid always; gid and pid only with
-# CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE, otherwise -1).  See "Running
-# as the local DNS server"
-# in README.md.
+# identify_processes and CAP_DAC_READ_SEARCH and CAP_SYS_PTRACE,
+# otherwise -1).  See "Running as the local DNS server" in README.md.
 #
 # [dns_frontend]
 # listen = "127.0.0.1:53"
 # upstream = "192.0.2.53:53"
+# identify_processes = false
+
+# ── Stacked front-ends (optional) ─────────────────────────────────────
+# With the NSS module in nsswitch.conf behind nscd, or several front-ends
+# at once, name the user nscd runs as so that its lookups on behalf of
+# already-judged callers pass through; see "Combining front-ends" in
+# README.md.  Each front-end section takes `enable = false`.
+#
+# nscd_user = "nscd"
+# [nss_frontend]
 
 # ── External blocklists ───────────────────────────────────────────────
 # Loaded at startup.  Supports hosts-file, domains-only, and AdBlock
