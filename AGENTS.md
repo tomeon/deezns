@@ -10,11 +10,14 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
 ## Flake layout
 
 - `flake.nix` uses flake-parts, the numtide devshell flake module, and
-  the treefmt-nix flake module. Supported systems: x86_64-linux and
-  aarch64-linux only; an NSS module is glibc-specific, and the daemon
-  relies on `SO_PEERCRED`, so there is nothing to build for Darwin.
-- `packages.deezns` is `nix/package.nix` called with `pkgs.callPackage`:
-  `rustPlatform.buildRustPackage` with `cargoLock.lockFile = ../Cargo.lock`
+  the treefmt-nix flake module, plus three local flake-parts modules:
+  `nix/packages.nix`, `nix/nixos-modules.nix` and `nix/checks.nix`.
+  Supported systems: x86_64-linux and aarch64-linux only; an NSS module
+  is glibc-specific, and the daemon relies on `SO_PEERCRED`, so there
+  is nothing to build for Darwin.
+- `packages.deezns` is `nix/pkgs/deezns/default.nix`, called with
+  `pkgs.callPackage` from `nix/packages.nix`:
+  `rustPlatform.buildRustPackage` with `cargoLock.lockFile = ../../../Cargo.lock`
   (no `cargoHash` to maintain; dependencies come straight from the
   lock file). `packages.default` is the same derivation.
   - `src` is a fileset of just `Cargo.toml`, `Cargo.lock`, `build.rs`
@@ -104,8 +107,10 @@ top: `flake.nix`, `flake.lock`, `nix/`, `scripts/`, `.github/`.
     DNS front-end behind either, instead of judging them as nsncd's.
     With the NSS module and the DNS front-end but no nscd front-end,
     `nssOrder` must stay below `dns`'s 1499.
-- `packages.nsncd` is nixpkgs' nsncd with `nix/nsncd-peer-cred.patch`, an
-  earlier prototype for the same problem: nsncd records each client's
+- `packages.nsncd` is `nix/pkgs/nsncd/default.nix`, called from
+  `nix/packages.nix`: nixpkgs' nsncd with
+  `nix/pkgs/nsncd/nsncd-peer-cred.patch`, an earlier prototype for the
+  same problem: nsncd records each client's
   `SO_PEERCRED` in a thread-local while handling its request and
   exports it from the binary as `nsncd_peer_cred()`, which an NSS
   module can find with `dlsym(RTLD_DEFAULT, ...)` on the thread doing

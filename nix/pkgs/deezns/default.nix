@@ -1,5 +1,5 @@
 # The deezns daemon and NSS module, built from this checkout with nixpkgs'
-# Rust toolchain.  `pkgs.callPackage ./nix/package.nix { socketPath = ...; }`
+# Rust toolchain.  `pkgs.callPackage ./nix/pkgs/deezns { socketPath = ...; }`
 # rebuilds it for another socket location.
 {
   lib,
