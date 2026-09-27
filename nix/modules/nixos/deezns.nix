@@ -101,7 +101,7 @@ moduleWithSystem (
           package with the `socketPath` argument, for example
 
           ```nix
-          services.deezns.package = pkgs.callPackage "''${deezns}/nix/package.nix" {
+          services.deezns.package = pkgs.callPackage "''${deezns}/nix/pkgs/deezns" {
             socketPath = "/run/deezns-alt/resolve.sock";
           };
           ```
